@@ -8,10 +8,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from . import telemetry
+from .debug_log import write_debug_event
+from .durable_execution import checkpoint_step
 
 TEXT_EXTENSIONS = {
     ".c",
@@ -48,6 +51,14 @@ IGNORED_DIRS = {".codegraph", ".git", ".next", ".nuxt", ".venv", "build", "cover
 TRUSTED_CONTEXT_FILES = ["AGENTS.md", "agents.md", "CLAUDE.md", ".cursorrules", "README.md", "package.json", "pyproject.toml", "requirements.txt"]
 
 
+def ignored_dirs() -> set[str]:
+    names = set(IGNORED_DIRS)
+    state_dir = str(os.getenv("AGENT_ENGINE_STATE_DIR") or "").strip()
+    if state_dir:
+        names.add(Path(state_dir).name)
+    return names
+
+
 def relpath(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
@@ -63,6 +74,7 @@ def walk_workspace(workspace: str, max_files: int = 180, max_depth: int = 5) -> 
     def walk(current: Path, depth: int) -> None:
         if len(files) >= max_files or depth > max_depth:
             return
+        ignored = ignored_dirs()
         try:
             entries = sorted(current.iterdir(), key=lambda item: item.name.lower())
         except OSError:
@@ -71,10 +83,12 @@ def walk_workspace(workspace: str, max_files: int = 180, max_depth: int = 5) -> 
             if len(files) >= max_files:
                 return
             if entry.is_dir():
-                if entry.name not in IGNORED_DIRS:
+                if entry.name not in ignored:
                     walk(entry, depth + 1)
                 continue
             if entry.is_file():
+                if entry.name == ".git":
+                    continue
                 stat = entry.stat()
                 files.append({"path": relpath(entry, root), "size": stat.st_size, "text": is_text(entry)})
 
@@ -87,11 +101,12 @@ def read_file(workspace: str, relative_path: str, max_chars: int = 20000) -> str
     target = (root / relative_path).resolve()
     if root not in target.parents and target != root:
         raise ValueError(f"Path escapes workspace: {relative_path}")
-    with telemetry.start_span("tool.file_read", {"tool.file.path": relative_path, "workspace.path": str(root)}):
-        text = target.read_text(encoding="utf-8", errors="replace")
-    if len(text) > max_chars:
-        return text[:max_chars] + f"\n\n...[truncated {len(text) - max_chars} chars]"
-    return text
+    with checkpoint_step("tool", "file_read", {"path": relative_path, "workspace": str(root)}) as durable_step:
+        with telemetry.start_span("tool.file_read", {"tool.file.path": relative_path, "workspace.path": str(root)}):
+            text = target.read_text(encoding="utf-8", errors="replace")
+        result = text[:max_chars] + f"\n\n...[truncated {len(text) - max_chars} chars]" if len(text) > max_chars else text
+        durable_step.set_output({"path": relative_path, "characters": len(text), "truncated": len(text) > max_chars})
+        return result
 
 
 def get_snapshot(workspace: str) -> dict[str, Any]:
@@ -150,30 +165,33 @@ def _run_codegraph(workspace: str, args: list[str], timeout: int = 45) -> dict[s
         "CODEGRAPH_TELEMETRY": "0",
         "NO_COLOR": "1",
     }
-    with telemetry.start_span("tool.codegraph", {"tool.name": "codegraph", "tool.args": " ".join(args), "workspace.path": str(Path(workspace).resolve())}) as span:
-        try:
-            proc = subprocess.run(
-                [binary, *args],
-                cwd=str(Path(workspace).resolve()),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
-            return {
-                "ok": proc.returncode == 0,
-                "status": "ok" if proc.returncode == 0 else "error",
-                "code": proc.returncode,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
-            }
-        except subprocess.TimeoutExpired as exc:
-            telemetry.set_span_attrs(span, {"tool.timed_out": True})
-            return {"ok": False, "status": "timeout", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
-        except Exception as exc:
-            telemetry.set_span_attrs(span, {"tool.error": str(exc)})
-            return {"ok": False, "status": "error", "reason": str(exc)}
+    with checkpoint_step("tool", "codegraph", {"args": args, "workspace": str(Path(workspace).resolve())}) as durable_step:
+        with telemetry.start_span("tool.codegraph", {"tool.name": "codegraph", "tool.args": " ".join(args), "workspace.path": str(Path(workspace).resolve())}) as span:
+            try:
+                proc = subprocess.run(
+                    [binary, *args],
+                    cwd=str(Path(workspace).resolve()),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
+                result = {
+                    "ok": proc.returncode == 0,
+                    "status": "ok" if proc.returncode == 0 else "error",
+                    "code": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                }
+            except subprocess.TimeoutExpired as exc:
+                telemetry.set_span_attrs(span, {"tool.timed_out": True})
+                result = {"ok": False, "status": "timeout", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
+            except Exception as exc:
+                telemetry.set_span_attrs(span, {"tool.error": str(exc)})
+                result = {"ok": False, "status": "error", "reason": str(exc)}
+            durable_step.set_output(result)
+            return result
 
 
 def _trim_text(value: Any, max_chars: int = 4000) -> str:
@@ -395,8 +413,21 @@ def enforce_change_policy(
             target.unlink()
 
     final_hashes = file_hashes(workspace)
+    final_changes = changed_files(before_hashes, final_hashes)
+    if violations:
+        write_debug_event(
+            "policy.violations",
+            {
+                "workspace": str(root),
+                "allowedFiles": allowed_patterns,
+                "forbiddenPaths": forbidden_patterns,
+                "violations": violations,
+                "changedFilesAfterRollback": final_changes,
+            },
+        )
     return {
-        "changedFiles": changed_files(before_hashes, final_hashes),
+        "sandboxDiff": changes,
+        "changedFiles": final_changes,
         "violations": violations,
     }
 
@@ -417,7 +448,7 @@ def find_project_roots(workspace: str) -> list[str]:
             roots.append("." if current == root else relpath(current, root))
             return
         for entry in sorted(entries, key=lambda item: item.name.lower()):
-            if entry.is_dir() and entry.name not in IGNORED_DIRS:
+            if entry.is_dir() and entry.name not in ignored_dirs():
                 walk(entry, depth + 1)
 
     walk(root, 0)
@@ -430,49 +461,95 @@ def _path_inside_workspace(workspace: str, relative_path: str) -> bool:
     return target == root or root in target.parents
 
 
-def create_workspace_sandbox(workspace: str) -> tempfile.TemporaryDirectory[str]:
+class WorkspaceSandbox:
+    def __init__(self, workspace: str, durable_path: str | Path | None = None) -> None:
+        self.source = Path(workspace).resolve()
+        self.durable = durable_path is not None
+        self.name = str(Path(durable_path).resolve()) if durable_path is not None else tempfile.mkdtemp(prefix="hethongagent-sandbox-")
+        self.sandbox_root = Path(self.name) / "workspace"
+        self._complete = not self.durable
+
+    def __enter__(self) -> str:
+        return self.name
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> bool:
+        if self._complete:
+            self.cleanup()
+        return False
+
+    def complete(self) -> None:
+        self._complete = True
+
+    def cleanup(self) -> None:
+        for attempt in range(5):
+            try:
+                shutil.rmtree(self.name)
+                return
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                if attempt >= 4:
+                    telemetry.record_sandbox_failure(f"cleanup:{exc.__class__.__name__}")
+                    return
+                time.sleep(0.2 * (attempt + 1))
+
+
+def create_workspace_sandbox(workspace: str, durable_path: str | Path | None = None) -> WorkspaceSandbox:
     source = Path(workspace).resolve()
-    temp = tempfile.TemporaryDirectory(prefix="hethongagent-sandbox-")
-    sandbox_root = Path(temp.name) / "workspace"
+    temp = WorkspaceSandbox(workspace, durable_path=durable_path)
+    sandbox_root = temp.sandbox_root
 
     def ignore(_dir: str, names: list[str]) -> set[str]:
-        return {name for name in names if name in IGNORED_DIRS}
+        ignored = ignored_dirs()
+        return {name for name in names if name in ignored or name == ".git"}
 
-    with telemetry.start_span("sandbox.create", {"workspace.path": str(source), "sandbox.path": str(sandbox_root)}):
-        try:
-            shutil.copytree(source, sandbox_root, ignore=ignore)
-            return temp
-        except Exception as exc:
-            telemetry.record_sandbox_failure(exc.__class__.__name__)
-            temp.cleanup()
-            raise
+    with checkpoint_step("tool", "sandbox_create", {"workspace": str(source), "sandbox": str(sandbox_root)}) as durable_step:
+        with telemetry.start_span("sandbox.create", {"workspace.path": str(source), "sandbox.path": str(sandbox_root)}):
+            try:
+                if sandbox_root.exists():
+                    durable_step.set_output({"sandbox": str(sandbox_root), "created": False, "reused": True})
+                    return temp
+                Path(temp.name).mkdir(parents=True, exist_ok=True)
+                shutil.copytree(source, sandbox_root, ignore=ignore)
+                durable_step.set_output({"sandbox": str(sandbox_root), "created": True})
+                return temp
+            except Exception as exc:
+                telemetry.record_sandbox_failure(exc.__class__.__name__)
+                temp.cleanup()
+                raise
 
 
 def apply_sandbox_changes(source_workspace: str, sandbox_workspace: str, changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_root = Path(source_workspace).resolve()
     sandbox_root = Path(sandbox_workspace).resolve()
     applied = []
-    with telemetry.start_span("sandbox.merge", {"workspace.path": str(source_root), "sandbox.path": str(sandbox_root), "change.count": len(changes)}):
-        for change in changes:
-            rel = _normalize_policy_path(change.get("path"))
-            if not rel:
-                continue
-            source_target = (source_root / rel).resolve()
-            sandbox_target = (sandbox_root / rel).resolve()
-            if source_target != source_root and source_root not in source_target.parents:
-                continue
-            if sandbox_target != sandbox_root and sandbox_root not in sandbox_target.parents:
-                continue
-            status = change.get("status")
-            if status == "deleted":
-                if source_target.exists() and source_target.is_file():
-                    source_target.unlink()
+    with checkpoint_step(
+        "tool",
+        "sandbox_merge",
+        {"workspace": str(source_root), "sandbox": str(sandbox_root), "changes": changes},
+    ) as durable_step:
+        with telemetry.start_span("sandbox.merge", {"workspace.path": str(source_root), "sandbox.path": str(sandbox_root), "change.count": len(changes)}):
+            for change in changes:
+                rel = _normalize_policy_path(change.get("path"))
+                if not rel:
+                    continue
+                source_target = (source_root / rel).resolve()
+                sandbox_target = (sandbox_root / rel).resolve()
+                if source_target != source_root and source_root not in source_target.parents:
+                    continue
+                if sandbox_target != sandbox_root and sandbox_root not in sandbox_target.parents:
+                    continue
+                status = change.get("status")
+                if status == "deleted":
+                    if source_target.exists() and source_target.is_file():
+                        source_target.unlink()
+                        applied.append(change)
+                    continue
+                if sandbox_target.exists() and sandbox_target.is_file():
+                    source_target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(sandbox_target, source_target)
                     applied.append(change)
-                continue
-            if sandbox_target.exists() and sandbox_target.is_file():
-                source_target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(sandbox_target, source_target)
-                applied.append(change)
+        durable_step.set_output({"applied": applied})
     return applied
 
 
@@ -582,43 +659,53 @@ def is_safe_command(command: str) -> bool:
 
 def run_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".", sandboxed: bool = False) -> dict[str, Any]:
     root = Path(workspace).resolve()
-    with telemetry.start_span(
-        "tool.command",
-        {
-            "tool.command": command,
-            "tool.cwd": cwd,
-            "tool.sandboxed": sandboxed,
-            "workspace.path": str(root),
-        },
-    ) as span:
-        if not is_safe_command(command):
-            telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "verification_allowlist"})
-            return {"command": command, "cwd": cwd, "skipped": True, "reason": "Command is not in verification allowlist."}
-        workdir = root if cwd == "." else (root / cwd).resolve()
-        if workdir != root and root not in workdir.parents:
-            telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "cwd_escape"})
-            return {"command": command, "cwd": cwd, "skipped": True, "reason": "Command cwd escapes workspace."}
-        try:
-            proc = subprocess.run(command, cwd=str(workdir), shell=True, capture_output=True, text=True, timeout=timeout)
-            telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
-            return {
-                "command": command,
-                "cwd": cwd,
-                "code": proc.returncode,
-                "stdout": proc.stdout[-20000:],
-                "stderr": proc.stderr[-20000:],
-                "timedOut": False,
-            }
-        except subprocess.TimeoutExpired as exc:
-            telemetry.set_span_attrs(span, {"tool.exit_code": -1, "tool.timed_out": True})
-            if sandboxed:
-                telemetry.record_sandbox_failure("command_timeout")
-            return {"command": command, "cwd": cwd, "code": None, "stdout": exc.stdout or "", "stderr": exc.stderr or "", "timedOut": True}
-        except Exception as exc:
-            telemetry.set_span_attrs(span, {"tool.error": str(exc)})
-            if sandboxed:
-                telemetry.record_sandbox_failure(exc.__class__.__name__)
-            return {"command": command, "cwd": cwd, "code": None, "stdout": "", "stderr": str(exc), "timedOut": False}
+    with checkpoint_step(
+        "tool",
+        "command",
+        {"command": command, "cwd": cwd, "sandboxed": sandboxed, "workspace": str(root)},
+    ) as durable_step:
+        with telemetry.start_span(
+            "tool.command",
+            {
+                "tool.command": command,
+                "tool.cwd": cwd,
+                "tool.sandboxed": sandboxed,
+                "workspace.path": str(root),
+            },
+        ) as span:
+            if not is_safe_command(command):
+                telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "verification_allowlist"})
+                result = {"command": command, "cwd": cwd, "skipped": True, "reason": "Command is not in verification allowlist.", "sandboxed": sandboxed}
+            else:
+                workdir = root if cwd == "." else (root / cwd).resolve()
+                if workdir != root and root not in workdir.parents:
+                    telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "cwd_escape"})
+                    result = {"command": command, "cwd": cwd, "skipped": True, "reason": "Command cwd escapes workspace.", "sandboxed": sandboxed}
+                else:
+                    try:
+                        proc = subprocess.run(command, cwd=str(workdir), shell=True, capture_output=True, text=True, timeout=timeout)
+                        telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
+                        result = {
+                            "command": command,
+                            "cwd": cwd,
+                            "code": proc.returncode,
+                            "stdout": proc.stdout[-20000:],
+                            "stderr": proc.stderr[-20000:],
+                            "timedOut": False,
+                            "sandboxed": sandboxed,
+                        }
+                    except subprocess.TimeoutExpired as exc:
+                        telemetry.set_span_attrs(span, {"tool.exit_code": -1, "tool.timed_out": True})
+                        if sandboxed:
+                            telemetry.record_sandbox_failure("command_timeout")
+                        result = {"command": command, "cwd": cwd, "code": None, "stdout": exc.stdout or "", "stderr": exc.stderr or "", "timedOut": True, "sandboxed": sandboxed}
+                    except Exception as exc:
+                        telemetry.set_span_attrs(span, {"tool.error": str(exc)})
+                        if sandboxed:
+                            telemetry.record_sandbox_failure(exc.__class__.__name__)
+                        result = {"command": command, "cwd": cwd, "code": None, "stdout": "", "stderr": str(exc), "timedOut": False, "sandboxed": sandboxed}
+        durable_step.set_output(result)
+        return result
 
 
 def run_sandboxed_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".") -> dict[str, Any]:

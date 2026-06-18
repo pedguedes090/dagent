@@ -30,6 +30,7 @@ function findPendingHumanGateTask(session) {
         task: String(task),
         originalTask: String(task),
         correlationId: run.humanGate.correlationId || run.correlationId || null,
+        executionId: run.humanGate.executionId || run.executionId || run.id || null,
         runIndex: index
       };
     }
@@ -49,7 +50,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     }
   });
 
@@ -110,6 +111,18 @@ function registerIpc() {
     return sessionStore.delete(sessionId);
   });
 
+  ipcMain.handle("agent:observability", async () => {
+    return backendService.getObservability();
+  });
+
+  ipcMain.handle("agent:autonomy-status", async () => {
+    return backendService.getAutonomyStatus();
+  });
+
+  ipcMain.handle("agent:autonomy-scan", async (_event, payload) => {
+    return backendService.runAutonomyScan({ workspacePath: payload?.workspacePath || "" });
+  });
+
   ipcMain.handle("agent:send", async (event, payload) => {
     const settings = settingsStore.save(payload?.settings || settingsStore.get());
     let session = payload?.sessionId ? sessionStore.get(payload.sessionId) : null;
@@ -164,11 +177,14 @@ function registerIpc() {
     session = sessionStore.save(session);
 
     activeRuns.add(session.id);
+    const progressEvents = [];
     const emitProgress = (progress) => {
-      event.sender.send("agent:progress", {
+      const eventRecord = {
         sessionId: session.id,
         ...progress
-      });
+      };
+      progressEvents.push(eventRecord);
+      event.sender.send("agent:progress", eventRecord);
     };
     if (pendingHumanGate) {
       emitProgress({
@@ -192,9 +208,14 @@ function registerIpc() {
               createdAt: pendingHumanGate.createdAt || null,
               approvedAt,
               correlationId: pendingHumanGate.correlationId || null,
+              executionId: pendingHumanGate.executionId || null,
               originalTask: pendingHumanGate.originalTask || pendingHumanGate.task,
               riskClass: pendingHumanGate.riskClass || "high",
-              reason: pendingHumanGate.reason || ""
+              reason: pendingHumanGate.reason || "",
+              kind: pendingHumanGate.kind || "risk_approval",
+              retryCount: Number(pendingHumanGate.retryCount || 0),
+              reworkCycle: Number(pendingHumanGate.reworkCycle || 0),
+              grantAdditionalAttempts: Number(pendingHumanGate.grantAdditionalAttempts || 0)
             }
           : null,
         emitProgress
@@ -209,35 +230,77 @@ function registerIpc() {
       };
 
       session.messages = [...session.messages, assistantMessage];
-      session.runs = [...(session.runs || []), run];
-      session.title = session.title === "Phiên mới" ? userMessage.content.slice(0, 48) : session.title;
-      session = sessionStore.save(session);
-
-      emitProgress({
+      const runIdentity = run.executionId || run.id;
+      const completionProgress = {
         stage: "done",
         detail: "Hoàn tất",
         at: new Date().toISOString()
+      };
+      const observedRun = {
+        ...run,
+        progressEvents: [
+          ...progressEvents,
+          {
+            sessionId: session.id,
+            ...completionProgress
+          }
+        ]
+      };
+      session.runs = [
+        ...(session.runs || []).filter((item) => (item.executionId || item.id) !== runIdentity),
+        observedRun
+      ];
+      session.title = session.title === "Phiên mới" ? userMessage.content.slice(0, 48) : session.title;
+      session = sessionStore.save(session);
+
+      event.sender.send("agent:progress", {
+        sessionId: session.id,
+        ...completionProgress
       });
 
       return {
         session,
         sessions: sessionStore.list(),
-        run
+        run: observedRun
       };
     } catch (error) {
+      const errorProgress = {
+        stage: "error",
+        detail: error.message,
+        at: new Date().toISOString()
+      };
+      const errorRun = {
+        id: crypto.randomUUID(),
+        executionId: null,
+        correlationId: progressEvents.find((item) => item.correlationId)?.correlationId || null,
+        task: engineContent,
+        assistantText: `Mình chưa chạy xong được: ${error.message}`,
+        changedFiles: [],
+        commandResults: [],
+        review: null,
+        error: error.message,
+        createdAt: errorProgress.at,
+        progressEvents: [
+          ...progressEvents,
+          {
+            sessionId: session.id,
+            ...errorProgress
+          }
+        ]
+      };
       const assistantMessage = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: `Mình chưa chạy xong được: ${error.message}`,
+        content: errorRun.assistantText,
         createdAt: new Date().toISOString(),
         error: true
       };
       session.messages = [...session.messages, assistantMessage];
+      session.runs = [...(session.runs || []), errorRun];
       session = sessionStore.save(session);
-      emitProgress({
-        stage: "error",
-        detail: error.message,
-        at: new Date().toISOString()
+      event.sender.send("agent:progress", {
+        sessionId: session.id,
+        ...errorProgress
       });
       return {
         session,
@@ -255,6 +318,10 @@ app.whenReady().then(async () => {
   appDatabase = new AppDatabase(userDataPath);
   settingsStore = new SettingsStore(appDatabase, userDataPath);
   sessionStore = new SessionStore(appDatabase, userDataPath);
+  const appRecovery = sessionStore.reconcileStartupState();
+  if (appRecovery.recoveredRuns) {
+    console.warn(`Recovered ${appRecovery.recoveredRuns} non-terminal UI run(s) in app DB.`);
+  }
   backendService = new AgentBackendService(userDataPath);
   registerIpc();
   createWindow();

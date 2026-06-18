@@ -259,6 +259,11 @@ class SessionStore {
       riskClass: row.risk_class,
       reason: row.reason,
       correlationId: runPayload.humanGate?.correlationId || runPayload.correlationId || null,
+      executionId: runPayload.humanGate?.executionId || runPayload.executionId || runPayload.id || null,
+      kind: runPayload.humanGate?.kind || "risk_approval",
+      retryCount: Number(runPayload.humanGate?.retryCount || 0),
+      reworkCycle: Number(runPayload.humanGate?.reworkCycle || 0),
+      grantAdditionalAttempts: Number(runPayload.humanGate?.grantAdditionalAttempts || 0),
       createdAt: row.created_at
     };
   }
@@ -284,6 +289,33 @@ class SessionStore {
       }
     }
     return approvedAt;
+  }
+
+  reconcileStartupState() {
+    const recoveredAt = nowIso();
+    const rows = this.database.db
+      .prepare("SELECT id, payload_json FROM runs WHERE status IN ('queued', 'running', 'needs_rework')")
+      .all();
+    if (!rows.length) return { recoveredRuns: 0 };
+
+    const updateRun = this.database.db.prepare("UPDATE runs SET status = ?, payload_json = ?, updated_at = ? WHERE id = ?");
+    this.database.transaction(() => {
+      rows.forEach((row) => {
+        const payload = parseJson(row.payload_json, {});
+        updateRun.run(
+          "recovered",
+          stringifyJson({
+            ...payload,
+            status: "recovered",
+            recoveredAt,
+            recoveryReason: "App restarted while this UI run was not terminal. Engine broker/checkpoint DB remains authoritative for execution recovery."
+          }),
+          recoveredAt,
+          row.id
+        );
+      });
+    });
+    return { recoveredRuns: rows.length };
   }
 }
 

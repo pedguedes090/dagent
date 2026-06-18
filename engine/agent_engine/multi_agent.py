@@ -67,9 +67,17 @@ def build_task_graph(task: str, problem: dict[str, Any], final_plan: dict[str, A
     }
 
 
-def governance_decision(task: str, problem: dict[str, Any], final_plan: dict[str, Any], task_graph: dict[str, Any]) -> dict[str, Any]:
+def governance_decision(
+    task: str,
+    task_intent: dict[str, Any],
+    problem: dict[str, Any],
+    final_plan: dict[str, Any],
+    task_graph: dict[str, Any],
+) -> dict[str, Any]:
     spec = final_plan.get("workerTaskSpec") or {}
-    risk = str(final_plan.get("riskClass") or problem.get("riskClass") or "medium").lower()
+    # Routing risk is deterministic. LLM-authored plan/problem risk fields are
+    # review metadata only and cannot choose a graph branch.
+    risk = str(task_intent.get("riskClass") or "medium").lower()
     text = f"{task} {problem.get('problemStatement', '')}".lower()
     sensitive_signals = [
         signal
@@ -92,13 +100,32 @@ def governance_decision(task: str, problem: dict[str, Any], final_plan: dict[str
     }
 
 
-def researcher_output(problem: dict[str, Any], trusted_context: dict[str, Any], codegraph_context: dict[str, Any] | None) -> dict[str, Any]:
+def researcher_output(
+    problem: dict[str, Any],
+    trusted_context: dict[str, Any],
+    codegraph_context: dict[str, Any] | None,
+    long_term_memory: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     trusted_files = [item.get("path") for item in trusted_context.get("files", []) if item.get("path")]
+    codegraph_content = str((codegraph_context or {}).get("content") or "")
+    memories = list((long_term_memory or {}).get("memories") or [])
     return {
-        "contextSummary": "Trusted root instructions and CodeGraph context collected for downstream agents.",
+        "contextSummary": "Trusted root instructions, CodeGraph context, and ACT-R long-term memory collected for downstream agents.",
         "relevantFiles": problem.get("relevantFiles", []),
         "trustedFiles": trusted_files,
         "codegraphEnabled": bool((codegraph_context or {}).get("enabled")),
+        "codegraphSummary": codegraph_content[:6000],
+        "longTermMemoryEnabled": bool((long_term_memory or {}).get("enabled")),
+        "longTermMemorySummary": [
+            {
+                "kind": item.get("kind"),
+                "source": item.get("source"),
+                "activation": item.get("activation"),
+                "tags": item.get("tags", []),
+                "content": str(item.get("content") or "")[:600],
+            }
+            for item in memories[:6]
+        ],
         "riskNotes": problem.get("constraints", []),
     }
 

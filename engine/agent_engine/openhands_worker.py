@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import os
 import json
+import re
+import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from . import telemetry
-from .workspace import apply_sandbox_changes, create_workspace_sandbox, enforce_change_policy, file_snapshots
+from .container_sandbox import ContainerTerminalTool, PolicyFileEditorTool, container_status
+from .debug_log import write_debug_event
+from .durable_execution import execution_artifact_dir, is_transient_error, record_checkpoint
+from .project_scaffold import scaffold_project_fallback, should_scaffold_todo_fallback
+from .workspace import apply_sandbox_changes, create_workspace_sandbox, enforce_change_policy, file_snapshots, pick_execution_root
 
 
 def _safe_model_dump(value: Any) -> Any:
@@ -111,6 +119,175 @@ def _load_json_config(paths: list[Path]) -> tuple[Path | None, Any]:
     return None, None
 
 
+_MCP_SAFE_COMMANDS = {"node", "python", "python3", "uv", "uvx", "npx", "pnpm", "bun"}
+_MCP_SECRET_ENV_RE = re.compile(
+    r"(secret|token|password|passwd|api[_-]?key|credential|private[_-]?key|authorization)",
+    re.IGNORECASE,
+)
+_MCP_PLACEHOLDER_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
+_MCP_SHELL_META_RE = re.compile(r"[;&|`<>$]")
+
+
+def _workspace_relative(root: Path, value: str) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    if resolved == root or root in resolved.parents:
+        return resolved
+    return None
+
+
+def _safe_mcp_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or _MCP_SHELL_META_RE.search(text):
+        return None
+    return text
+
+
+def _validate_mcp_secrets(container: dict[str, Any], label: str, emit: Callable[[str, str], None]) -> bool:
+    for key, value in container.items():
+        if not _MCP_SECRET_ENV_RE.search(str(key)):
+            continue
+        if isinstance(value, str) and _MCP_PLACEHOLDER_RE.match(value.strip()):
+            continue
+        emit("openhands_mcp", f"Ignored MCP server {label}: secret field {key} must use ${{ENV_VAR}} placeholder")
+        return False
+    return True
+
+
+def _sanitize_mcp_server(
+    *,
+    root: Path,
+    name: str,
+    config: Any,
+    trusted_servers: set[str],
+    allowed_commands: set[str],
+    emit: Callable[[str, str], None],
+) -> dict[str, Any] | None:
+    if not isinstance(config, dict):
+        emit("openhands_mcp", f"Ignored MCP server {name}: expected object config")
+        return None
+    if config.get("enabled", True) is False:
+        return None
+    if name not in trusted_servers and not bool(config.get("trusted") or config.get("allow")):
+        emit("openhands_mcp", f"Ignored MCP server {name}: not listed in trustedServers")
+        return None
+
+    sanitized = {key: value for key, value in config.items() if key not in {"trusted", "allow", "enabled"}}
+    command = sanitized.get("command")
+    url = sanitized.get("url")
+    if command:
+        command_text = _safe_mcp_string(command)
+        if not command_text:
+            emit("openhands_mcp", f"Ignored MCP server {name}: unsafe command")
+            return None
+        path_like = any(separator in command_text for separator in ("/", "\\")) or command_text.startswith(".")
+        if path_like:
+            resolved = _workspace_relative(root, command_text)
+            if not resolved or not resolved.exists():
+                emit("openhands_mcp", f"Ignored MCP server {name}: command must stay inside workspace and exist")
+                return None
+            sanitized["command"] = str(resolved)
+        elif command_text not in allowed_commands:
+            emit("openhands_mcp", f"Ignored MCP server {name}: command {command_text} is not allowlisted")
+            return None
+
+        args = sanitized.get("args", [])
+        if args is None:
+            args = []
+        if not isinstance(args, list):
+            emit("openhands_mcp", f"Ignored MCP server {name}: args must be an array")
+            return None
+        normalized_args: list[str] = []
+        for arg in args:
+            arg_text = _safe_mcp_string(arg)
+            if arg_text is None:
+                emit("openhands_mcp", f"Ignored MCP server {name}: unsafe arg")
+                return None
+            parsed = urlparse(arg_text)
+            if not parsed.scheme and (arg_text.startswith(("/", "\\", "../", "..\\", "./", ".\\"))):
+                if not _workspace_relative(root, arg_text):
+                    emit("openhands_mcp", f"Ignored MCP server {name}: arg path escapes workspace")
+                    return None
+            normalized_args.append(arg_text)
+        sanitized["args"] = normalized_args
+
+        cwd = sanitized.get("cwd") or sanitized.get("workingDirectory")
+        if cwd:
+            resolved_cwd = _workspace_relative(root, str(cwd))
+            if not resolved_cwd or not resolved_cwd.exists() or not resolved_cwd.is_dir():
+                emit("openhands_mcp", f"Ignored MCP server {name}: cwd must be an existing workspace directory")
+                return None
+            sanitized["cwd"] = str(resolved_cwd)
+            sanitized.pop("workingDirectory", None)
+
+    if url:
+        parsed = urlparse(str(url))
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            emit("openhands_mcp", f"Ignored MCP server {name}: url must be http(s)")
+            return None
+
+    if not command and not url:
+        emit("openhands_mcp", f"Ignored MCP server {name}: missing command or url")
+        return None
+
+    env = sanitized.get("env")
+    if env is not None:
+        if not isinstance(env, dict) or not _validate_mcp_secrets(env, name, emit):
+            return None
+
+    headers = sanitized.get("headers")
+    if headers is not None:
+        if not isinstance(headers, dict) or not _validate_mcp_secrets(headers, name, emit):
+            return None
+
+    return sanitized
+
+
+def _sanitize_mcp_config(root: Path, raw: dict[str, Any], emit: Callable[[str, str], None]) -> dict[str, Any]:
+    servers = raw.get("mcpServers") if isinstance(raw.get("mcpServers"), dict) else raw.get("servers")
+    if not isinstance(servers, dict):
+        emit("openhands_mcp", "Ignored MCP config: expected mcpServers object")
+        return {}
+
+    trusted = raw.get("trustedServers", [])
+    if isinstance(trusted, str):
+        trusted_servers = {trusted}
+    elif isinstance(trusted, list):
+        trusted_servers = {str(item) for item in trusted if str(item).strip()}
+    else:
+        trusted_servers = set()
+
+    allowed = raw.get("allowedCommands", [])
+    allowed_commands = set(_MCP_SAFE_COMMANDS)
+    if isinstance(allowed, list):
+        allowed_commands.update(str(item).strip() for item in allowed if str(item).strip())
+
+    sanitized_servers: dict[str, Any] = {}
+    for name, config in servers.items():
+        server_name = str(name)
+        sanitized = _sanitize_mcp_server(
+            root=root,
+            name=server_name,
+            config=config,
+            trusted_servers=trusted_servers,
+            allowed_commands=allowed_commands,
+            emit=emit,
+        )
+        if sanitized:
+            sanitized_servers[server_name] = sanitized
+
+    if not sanitized_servers:
+        return {}
+    return {"mcpServers": sanitized_servers}
+
+
 def _load_plugin_sources(workspace: str, emit: Callable[[str, str], None]) -> list[Any]:
     try:
         from openhands.sdk.plugin import PluginSource
@@ -167,8 +344,130 @@ def _load_mcp_config(workspace: str, emit: Callable[[str, str], None]) -> dict[s
     if not isinstance(raw, dict):
         emit("openhands_mcp", f"Ignored {config_path.name}: expected a JSON object")
         return {}
-    emit("openhands_mcp", f"Loaded MCP config from {config_path.relative_to(root)}")
-    return raw
+    sanitized = _sanitize_mcp_config(root.resolve(), raw, emit)
+    if not sanitized:
+        emit("openhands_mcp", f"No trusted MCP servers loaded from {config_path.relative_to(root)}")
+        return {}
+    server_count = len(sanitized.get("mcpServers") or {})
+    emit("openhands_mcp", f"Loaded {server_count} trusted MCP server(s) from {config_path.relative_to(root)}")
+    write_debug_event(
+        "openhands.mcp_loaded",
+        {
+            "configPath": str(config_path.relative_to(root)),
+            "serverNames": sorted((sanitized.get("mcpServers") or {}).keys()),
+        },
+    )
+    return sanitized
+
+
+def _worker_result(
+    *,
+    workspace: str,
+    worker_task_spec: dict[str, Any],
+    summary: str,
+    error: str | None,
+    model: str | None,
+    raw_result: Any = None,
+    sandbox_diff: list[dict[str, Any]] | None = None,
+    policy_violations: list[dict[str, Any]] | None = None,
+    applied_changes: list[dict[str, Any]] | None = None,
+    scaffold_fallback: dict[str, Any] | None = None,
+    sandboxed: bool = True,
+    events: list[str] | None = None,
+) -> dict[str, Any]:
+    applied = list(applied_changes or [])
+    result = {
+        "summary": summary,
+        "error": error,
+        "model": model,
+        "rawResult": str(raw_result)[:4000] if raw_result is not None else "",
+        "sandboxDiff": list(sandbox_diff or []),
+        "policyViolations": list(policy_violations or []),
+        "appliedChanges": applied,
+        "changedFiles": applied,
+        "selectedExecutionRoot": pick_execution_root(workspace, {"changedFiles": applied}, worker_task_spec),
+        "verificationSpec": {
+            "commandsToRun": list(worker_task_spec.get("commandsToRun") or []),
+            "verificationCommands": list(worker_task_spec.get("verificationCommands") or []),
+            "verificationCwd": worker_task_spec.get("verificationCwd"),
+            "projectRoot": worker_task_spec.get("projectRoot"),
+            "projectStack": worker_task_spec.get("projectStack"),
+        },
+        "scaffoldFallback": scaffold_fallback,
+        "sandboxed": sandboxed,
+        "events": list(events or [])[-120:],
+    }
+    write_debug_event(
+        "coder_agent.worker_result",
+        {
+            "summary": result["summary"],
+            "error": result["error"],
+            "sandboxDiff": result["sandboxDiff"],
+            "policyViolations": result["policyViolations"],
+            "appliedChanges": result["appliedChanges"],
+            "selectedExecutionRoot": result["selectedExecutionRoot"],
+        },
+    )
+    return result
+
+
+def _execution_environment(worker_task_spec: dict[str, Any]) -> dict[str, Any]:
+    envelope = worker_task_spec.get("contextEnvelope") or {}
+    inputs = envelope.get("inputs") if isinstance(envelope, dict) else {}
+    environment = (inputs or {}).get("executionEnvironment") if isinstance(inputs, dict) else {}
+    return environment if isinstance(environment, dict) else {}
+
+
+def _container_available(worker_task_spec: dict[str, Any]) -> bool:
+    environment = _execution_environment(worker_task_spec)
+    if "containerAvailable" in environment:
+        return bool(environment.get("containerAvailable"))
+    status = container_status(str(worker_task_spec.get("projectStack") or "generic"))
+    return bool(status.get("ready"))
+
+
+def _run_deterministic_scaffold_fallback(
+    *,
+    workspace: str,
+    worker_task_spec: dict[str, Any],
+    emit: Callable[[str, str], None],
+    dependency_workspace: str | None,
+    worktree_isolated: bool,
+    reason: str,
+) -> dict[str, Any]:
+    before_snapshot = file_snapshots(dependency_workspace) if worktree_isolated and dependency_workspace else file_snapshots(workspace)
+    emit("coder_agent", reason)
+    fallback_result = scaffold_project_fallback(workspace, worker_task_spec)
+    write_debug_event("coder_agent.scaffold_fallback", {**fallback_result, "reason": reason})
+    policy = enforce_change_policy(
+        workspace,
+        before_snapshot,
+        list(worker_task_spec.get("allowedFiles") or []),
+        list(worker_task_spec.get("forbiddenPaths") or []),
+    )
+    applied = list(policy["changedFiles"])
+    violations = policy["violations"]
+    summary = "Coder agent used deterministic local scaffold fallback."
+    error = None
+    if violations:
+        summary = "Deterministic local scaffold changes were filtered by allowedFiles policy."
+        error = "Deterministic scaffold attempted to change files outside allowedFiles or inside forbiddenPaths."
+    elif should_scaffold_todo_fallback(worker_task_spec) and not applied:
+        summary = "Deterministic local scaffold produced no file changes."
+        error = "Scaffold fallback completed without creating project files."
+    return _worker_result(
+        workspace=workspace,
+        worker_task_spec=worker_task_spec,
+        summary=summary,
+        error=error,
+        model=None,
+        sandbox_diff=policy.get("sandboxDiff"),
+        policy_violations=violations,
+        applied_changes=applied,
+        scaffold_fallback=fallback_result,
+        sandboxed=False,
+        events=[f"coder_agent: {reason}"],
+    )
 
 
 def run_openhands_worker(
@@ -180,27 +479,67 @@ def run_openhands_worker(
     worker_task_spec: dict[str, Any],
     rework_context: dict[str, Any] | None,
     emit: Callable[[str, str], None],
+    execution_id: str | None = None,
+    worker_attempt: int = 1,
+    dependency_workspace: str | None = None,
+    worktree_isolated: bool = False,
 ) -> dict[str, Any]:
-    emit("coder_agent", "Starting sandboxed OpenHands coding agent")
+    container_available = _container_available(worker_task_spec)
+    emit("coder_agent", "Starting OpenHands coding agent" if container_available else "Starting policy-limited coding worker without Docker/Podman")
+    events: list[str] = []
+
+    if not container_available and should_scaffold_todo_fallback(worker_task_spec):
+        return _run_deterministic_scaffold_fallback(
+            workspace=workspace,
+            worker_task_spec=worker_task_spec,
+            emit=emit,
+            dependency_workspace=dependency_workspace,
+            worktree_isolated=worktree_isolated,
+            reason="Docker/Podman unavailable; using deterministic local Todo scaffold fallback",
+        )
 
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
         from openhands.sdk.context.condenser import LLMSummarizingCondenser
-        from openhands.tools.file_editor import FileEditorTool
         from openhands.tools.task_tracker import TaskTrackerTool
-        from openhands.tools.terminal import TerminalTool
     except Exception as exc:
-        return {
-            "summary": "OpenHands SDK is not available.",
-            "error": str(exc),
-            "changedFiles": [],
-            "events": [],
-        }
+        if should_scaffold_todo_fallback(worker_task_spec):
+            return _run_deterministic_scaffold_fallback(
+                workspace=workspace,
+                worker_task_spec=worker_task_spec,
+                emit=emit,
+                dependency_workspace=dependency_workspace,
+                worktree_isolated=worktree_isolated,
+                reason=f"OpenHands SDK unavailable; using deterministic local Todo scaffold fallback: {exc}",
+            )
+        return _worker_result(
+            workspace=workspace,
+            worker_task_spec=worker_task_spec,
+            summary="OpenHands SDK is not available.",
+            error=str(exc),
+            model=None,
+            sandbox_diff=[],
+            policy_violations=[],
+            applied_changes=[],
+            sandboxed=False,
+            events=events,
+        )
 
-    events: list[str] = []
+    fallback_result: dict[str, Any] | None = None
+    run_result: Any = None
 
     def on_event(event: Any) -> None:
         stage, detail = _event_summary(event)
+        record_checkpoint(
+            "openhands_event",
+            event.__class__.__name__,
+            {
+                "stage": stage,
+                "detail": detail,
+                "toolName": str(getattr(event, "tool_name", "") or ""),
+                "event": _safe_model_dump(event),
+            },
+        )
         with telemetry.start_span(
             "tool.openhands_event",
             {
@@ -219,100 +558,238 @@ def run_openhands_worker(
     if server_url and model.startswith("gemini/"):
         openhands_model = f"openai/{model}"
 
-    llm = LLM(
-        model=openhands_model,
-        api_key=api_key or os.getenv("LLM_API_KEY", "local-no-key"),
-        base_url=server_url,
-        stream=False,
-        timeout=300,
-        native_tool_calling=False,
-    )
-    plugins = _load_plugin_sources(workspace, emit)
-    mcp_config = _load_mcp_config(workspace, emit)
-    condenser = LLMSummarizingCondenser(llm=llm)
-    emit("openhands_context", "LLM summarizing condenser enabled")
-    agent = Agent(
-        llm=llm,
-        condenser=condenser,
-        mcp_config=mcp_config,
-        tool_concurrency_limit=1,
-        tools=[
-            Tool(name=TerminalTool.name),
-            Tool(name=FileEditorTool.name),
-            Tool(name=TaskTrackerTool.name),
-        ],
-    )
-    task = (
-        "You are the Coder Agent in a multi-agent LangGraph pipeline.\n"
-        "Follow this worker task spec exactly. Do not edit files outside allowedFiles. "
-        "Do not create tests unless the spec explicitly asks for tests. "
-        "If codegraphContext is enabled, use it as code data for orientation and impact analysis; "
-        "prefer it over broad grep/read discovery, but read live files directly before editing them.\n\n"
-        f"WORKER_TASK_SPEC:\n{worker_task_spec}\n\n"
-        f"REWORK_CONTEXT:\n{rework_context or {}}\n"
-    )
-    with create_workspace_sandbox(workspace) as temp_dir:
-        sandbox_workspace = str(Path(temp_dir) / "workspace")
-        before_snapshot = file_snapshots(sandbox_workspace)
-        emit("coder_agent", "Sandbox workspace ready")
-        conversation = Conversation(
-            agent=agent,
-            workspace=sandbox_workspace,
-            plugins=plugins or None,
-            callbacks=[on_event],
-            max_iteration_per_run=80,
-            visualizer=None,
-            delete_on_close=False,
+    try:
+        llm = LLM(
+            model=openhands_model,
+            api_key=api_key or os.getenv("LLM_API_KEY", "local-no-key"),
+            base_url=server_url,
+            stream=False,
+            timeout=300,
+            native_tool_calling=False,
         )
-        try:
-            with telemetry.start_span(
-                "tool.openhands_conversation",
-                {
-                    "agent.role": "coder",
-                    "llm.model": openhands_model,
-                    "workspace.path": sandbox_workspace,
+        plugins = _load_plugin_sources(workspace, emit)
+        mcp_config = _load_mcp_config(workspace, emit)
+        condenser = LLMSummarizingCondenser(llm=llm)
+        emit("openhands_context", "LLM summarizing condenser enabled")
+        tools = [
+            Tool(
+                name=PolicyFileEditorTool.name,
+                params={
+                    "allowed_files": list(worker_task_spec.get("allowedFiles") or []),
+                    "forbidden_paths": list(worker_task_spec.get("forbiddenPaths") or []),
                 },
-            ):
-                conversation.send_message(task)
-                run_result = conversation.run()
-        except Exception as exc:
+            ),
+            Tool(name=TaskTrackerTool.name),
+        ]
+        if container_available:
+            tools.insert(
+                0,
+                Tool(
+                    name=ContainerTerminalTool.name,
+                    params={
+                        "stack": str(worker_task_spec.get("projectStack") or "generic"),
+                        "dependency_workspace": dependency_workspace,
+                    },
+                ),
+            )
+        else:
+            emit("coder_agent", "Docker/Podman unavailable; shell tool disabled and file edits remain policy-limited")
+        agent = Agent(
+            llm=llm,
+            condenser=condenser,
+            mcp_config=mcp_config,
+            tool_concurrency_limit=1,
+            tools=tools,
+        )
+        shell_policy = (
+            "Use container_terminal for every shell command; it runs with no network, dropped capabilities, "
+            "and a read-only container root filesystem. "
+            if container_available
+            else "Docker/Podman is not available in this environment. Do not run shell commands; no terminal tool is available. "
+            "Use policy_file_editor for file changes and rely on the later verifier to run allowlisted commands on an isolated copy. "
+        )
+        task = (
+            "You are the Coder Agent in a multi-agent LangGraph pipeline.\n"
+            "Follow this worker task spec exactly. Do not edit files outside allowedFiles. "
+            "Do not create tests unless the spec explicitly asks for tests. "
+            "You receive only an explicit context envelope. Do not assume access to any prior conversation "
+            "or agent output that is absent from it. "
+            f"{shell_policy}"
+            "Use policy_file_editor for files; it enforces allowedFiles and forbiddenPaths on reads/writes.\n\n"
+            f"WORKER_TASK_SPEC:\n{worker_task_spec}\n\n"
+            f"REWORK_CONTEXT:\n{rework_context or {}}\n"
+        )
+    except Exception as exc:
+        return _worker_result(
+            workspace=workspace,
+            worker_task_spec=worker_task_spec,
+            summary="Coder agent failed during OpenHands setup.",
+            error=str(exc),
+            model=openhands_model,
+            sandbox_diff=[],
+            policy_violations=[],
+            applied_changes=[],
+            sandboxed=False,
+            events=events,
+        )
+    policy: dict[str, Any] = {"sandboxDiff": [], "changedFiles": [], "violations": []}
+    applied: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = []
+    artifact_root = execution_artifact_dir(execution_id) / f"coder-{max(1, int(worker_attempt))}" if execution_id else None
+    persistence_dir = artifact_root / "conversations" if artifact_root else None
+    conversation_id = uuid.uuid5(uuid.NAMESPACE_URL, f"hethongagent:{execution_id}:coder:{worker_attempt}") if execution_id else None
+    durable_sandbox_path = artifact_root / "sandbox" if artifact_root else None
+    if persistence_dir:
+        persistence_dir.mkdir(parents=True, exist_ok=True)
+    conversation_storage = persistence_dir / conversation_id.hex if persistence_dir and conversation_id else None
+    resume_conversation = bool(conversation_storage and conversation_storage.exists() and any(conversation_storage.iterdir()))
+    try:
+        sandbox = None if worktree_isolated else create_workspace_sandbox(workspace, durable_path=durable_sandbox_path)
+        sandbox_context = nullcontext(workspace) if worktree_isolated else sandbox
+        with sandbox_context as temp_dir:
+            sandbox_workspace = str(Path(temp_dir) if worktree_isolated else Path(temp_dir) / "workspace")
+            # For a resumed durable sandbox, compare against the untouched source
+            # workspace so edits completed before the interruption are included.
+            if worktree_isolated and dependency_workspace:
+                before_snapshot = file_snapshots(dependency_workspace)
+            else:
+                before_snapshot = file_snapshots(workspace) if durable_sandbox_path else file_snapshots(sandbox_workspace)
+            emit(
+                "coder_agent",
+                "Execution worktree mounted for container tools"
+                if worktree_isolated
+                else ("Durable sandbox workspace ready" if durable_sandbox_path else "Sandbox workspace ready"),
+            )
+            try:
+                conversation = Conversation(
+                    agent=agent,
+                    workspace=sandbox_workspace,
+                    plugins=plugins or None,
+                    persistence_dir=persistence_dir,
+                    conversation_id=conversation_id,
+                    callbacks=[on_event],
+                    max_iteration_per_run=80,
+                    visualizer=None,
+                    delete_on_close=False,
+                )
+                with telemetry.start_span(
+                    "tool.openhands_conversation",
+                    {
+                        "agent.role": "coder",
+                        "llm.model": openhands_model,
+                        "workspace.path": sandbox_workspace,
+                    },
+                ):
+                    if resume_conversation:
+                        emit("coder_agent", f"Resuming persisted OpenHands conversation {conversation_id}")
+                    else:
+                        conversation.send_message(task)
+                    run_result = conversation.run()
+            except Exception as exc:
+                if is_transient_error(exc):
+                    emit("resume", f"OpenHands transient failure persisted for retry: {exc}")
+                    record_checkpoint(
+                        "openhands",
+                        "transient_failure",
+                        {
+                            "conversationId": str(conversation_id or ""),
+                            "persistenceDir": str(persistence_dir or ""),
+                            "sandbox": sandbox_workspace,
+                            "error": str(exc),
+                        },
+                    )
+                    raise
+                policy = enforce_change_policy(
+                    sandbox_workspace,
+                    before_snapshot,
+                    list(worker_task_spec.get("allowedFiles") or []),
+                    list(worker_task_spec.get("forbiddenPaths") or []),
+                )
+                applied = list(policy["changedFiles"]) if worktree_isolated else apply_sandbox_changes(workspace, sandbox_workspace, policy["changedFiles"])
+                if sandbox:
+                    sandbox.complete()
+                return _worker_result(
+                    workspace=workspace,
+                    worker_task_spec=worker_task_spec,
+                    summary="Coder agent failed inside sandbox.",
+                    error=str(exc),
+                    model=openhands_model,
+                    raw_result=run_result,
+                    sandbox_diff=policy.get("sandboxDiff"),
+                    policy_violations=policy["violations"],
+                    applied_changes=applied,
+                    scaffold_fallback=fallback_result,
+                    sandboxed=True,
+                    events=events,
+                )
+            finally:
+                close = getattr(locals().get("conversation"), "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:
+                        emit("coder_agent", f"OpenHands cleanup warning: {exc}")
             policy = enforce_change_policy(
                 sandbox_workspace,
                 before_snapshot,
                 list(worker_task_spec.get("allowedFiles") or []),
                 list(worker_task_spec.get("forbiddenPaths") or []),
             )
-            applied = apply_sandbox_changes(workspace, sandbox_workspace, policy["changedFiles"])
-            return {
-                "summary": "Coder agent failed inside sandbox.",
-                "error": str(exc),
-                "model": openhands_model,
-                "changedFiles": applied,
-                "policyViolations": policy["violations"],
-                "sandboxed": True,
-                "events": events[-120:],
-            }
-        policy = enforce_change_policy(
-            sandbox_workspace,
-            before_snapshot,
-            list(worker_task_spec.get("allowedFiles") or []),
-            list(worker_task_spec.get("forbiddenPaths") or []),
+            files = policy["changedFiles"]
+            violations = policy["violations"]
+            if not files and not violations and should_scaffold_todo_fallback(worker_task_spec):
+                emit("coder_agent", "OpenHands produced no files; using deterministic todo scaffold fallback")
+                fallback_result = scaffold_project_fallback(sandbox_workspace, worker_task_spec)
+                write_debug_event("coder_agent.scaffold_fallback", fallback_result)
+                policy = enforce_change_policy(
+                    sandbox_workspace,
+                    before_snapshot,
+                    list(worker_task_spec.get("allowedFiles") or []),
+                    list(worker_task_spec.get("forbiddenPaths") or []),
+                )
+                files = policy["changedFiles"]
+                violations = policy["violations"]
+            applied = list(files) if worktree_isolated else apply_sandbox_changes(workspace, sandbox_workspace, files)
+            if sandbox:
+                sandbox.complete()
+    except Exception as exc:
+        if is_transient_error(exc):
+            raise
+        return _worker_result(
+            workspace=workspace,
+            worker_task_spec=worker_task_spec,
+            summary="Coder agent failed while preparing or cleaning sandbox.",
+            error=str(exc),
+            model=openhands_model,
+            raw_result=run_result,
+            sandbox_diff=policy.get("sandboxDiff"),
+            policy_violations=violations,
+            applied_changes=applied,
+            scaffold_fallback=fallback_result,
+            sandboxed=True,
+            events=events,
         )
-        files = policy["changedFiles"]
-        violations = policy["violations"]
-        applied = apply_sandbox_changes(workspace, sandbox_workspace, files)
     summary = "Coder agent completed in sandbox."
     error = None
     if violations:
         summary = "Coder agent changes were filtered by allowedFiles policy."
         error = "Coder attempted to change files outside allowedFiles or inside forbiddenPaths."
-    return {
-        "summary": summary,
-        "error": error,
-        "model": openhands_model,
-        "rawResult": str(run_result)[:4000],
-        "changedFiles": applied,
-        "policyViolations": violations,
-        "sandboxed": True,
-        "events": events[-120:],
-    }
+    elif fallback_result and fallback_result.get("used"):
+        summary = "Coder agent used deterministic todo scaffold fallback after OpenHands produced no file changes."
+    elif should_scaffold_todo_fallback(worker_task_spec) and not applied:
+        summary = "Coder agent produced no file changes."
+        error = "Coder completed without creating project files."
+    return _worker_result(
+        workspace=workspace,
+        worker_task_spec=worker_task_spec,
+        summary=summary,
+        error=error,
+        model=openhands_model,
+        raw_result=run_result,
+        sandbox_diff=policy.get("sandboxDiff"),
+        policy_violations=violations,
+        applied_changes=applied,
+        scaffold_fallback=fallback_result,
+        sandboxed=True,
+        events=events,
+    )

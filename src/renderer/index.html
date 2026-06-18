@@ -45,25 +45,59 @@
         <div id="saveStatus" class="save-status"></div>
       </section>
 
-      <main class="workspace">
-        <section class="chat-panel">
-          <div id="messages" class="messages"></div>
-          <form id="composer" class="composer">
+      <main class="workspace dashboard-workspace">
+        <section class="dashboard-panel" aria-label="Bảng điều khiển tác tử">
+          <div class="dashboard-header">
+            <div>
+              <p class="eyebrow">Web Dashboard</p>
+              <h2>Trạng thái nút xử lý</h2>
+            </div>
+            <div id="runState" class="run-state">Sẵn sàng</div>
+          </div>
+
+          <form id="composer" class="task-composer" aria-label="Khởi chạy tác vụ">
             <textarea
               id="messageInput"
-              rows="1"
-              placeholder="Nhập việc cần làm trong thư mục đang mở"
+              rows="2"
+              placeholder="Mô tả tác vụ cần chạy trong workspace đang mở"
             ></textarea>
-            <button id="sendBtn" class="send-button" type="submit">Gửi</button>
+            <button id="sendBtn" class="send-button" type="submit">Chạy</button>
           </form>
+
+          <div id="dashboardMetrics" class="dashboard-metrics"></div>
+          <div id="dagBoard" class="dag-board"></div>
+
+          <div class="dashboard-grid">
+            <section class="summary-card">
+              <h3>Kết quả gần nhất</h3>
+              <div id="runSummary" class="run-summary"></div>
+            </section>
+            <section class="summary-card">
+              <h3>Tệp & blocker</h3>
+              <div id="artifactList" class="artifact-list"></div>
+            </section>
+            <section class="summary-card autonomy-card">
+              <div class="autonomy-header">
+                <div>
+                  <p class="eyebrow">Autonomy L4/L5</p>
+                  <h3>Memory, debt discovery & skill proposals</h3>
+                </div>
+                <button id="autonomyScanBtn" class="ghost-button small-button" type="button">Quét idle</button>
+              </div>
+              <div id="autonomyStatus" class="autonomy-status">Chưa có dữ liệu autonomy.</div>
+              <div id="autonomySummary" class="autonomy-summary"></div>
+            </section>
+          </div>
         </section>
 
         <aside class="run-panel">
           <div class="run-panel-header">
-            <h2>Luồng chạy</h2>
-            <div id="runState" class="run-state">Sẵn sàng</div>
+            <h2>Nhật ký giám sát</h2>
+            <button id="refreshObservabilityBtn" class="ghost-button small-button" type="button">Làm mới</button>
           </div>
           <div id="progressList" class="progress-list"></div>
+          <div class="system-log-header">Backend events</div>
+          <div id="systemLogList" class="system-log-list"></div>
         </aside>
       </main>
     </div>

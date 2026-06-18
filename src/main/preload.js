@@ -11,6 +11,9 @@ contextBridge.exposeInMainWorld("agentApp", {
     ipcRenderer.invoke("sessions:updateWorkspace", sessionId, workspacePath),
   deleteSession: (sessionId) => ipcRenderer.invoke("sessions:delete", sessionId),
   sendMessage: (payload) => ipcRenderer.invoke("agent:send", payload),
+  getObservability: () => ipcRenderer.invoke("agent:observability"),
+  getAutonomyStatus: () => ipcRenderer.invoke("agent:autonomy-status"),
+  runAutonomyScan: (payload) => ipcRenderer.invoke("agent:autonomy-scan", payload),
   onProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);
     ipcRenderer.on("agent:progress", listener);

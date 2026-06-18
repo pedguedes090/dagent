@@ -1,0 +1,11 @@
+packages:
+  - "."
+
+# Shared by every git worktree. Project node_modules contains symlinks into
+# pnpm's central virtual store instead of a separate node_modules/.pnpm copy.
+enableGlobalVirtualStore: true
+
+# pnpm v11 blocks dependency lifecycle scripts by default. Electron's install
+# script is required to fetch the platform binary used by `pnpm start`.
+allowBuilds:
+  electron: true

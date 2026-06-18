@@ -1,0 +1,176 @@
+version: 1
+name: dagent-secure-deterministic-v1
+
+limits:
+  maxReworkAttempts: 2
+  approvalGrantAttempts: 1
+
+nodes:
+  - preflight
+  - codegraph_context
+  - intake_user_intent
+  - intake_ambiguity
+  - intake_repo_context
+  - intake_synthesizer
+  - planning_minimal
+  - planning_robust
+  - planning_test_first
+  - critique_risk
+  - critique_test_coverage
+  - critique_security_regression
+  - plan_arbiter
+  - planner_task_graph
+  - researcher_context_agent
+  - governance_service
+  - human_gate
+  - environment_gate
+  - read_only_reporter
+  - load_context_files
+  - openhands_worker
+  - tester_agent
+  - security_reviewer_agent
+  - code_reviewer_agent
+  - release_deploy_agent
+  - reviewer_decision
+  - execution_gate
+  - reporter
+  - finalize_workspace
+  - reporter_end
+
+edges:
+  - [START, preflight]
+  - [preflight, codegraph_context]
+  - [intake_synthesizer, planning_minimal]
+  - [intake_synthesizer, planning_robust]
+  - [intake_synthesizer, planning_test_first]
+  - [plan_arbiter, planner_task_graph]
+  - [planner_task_graph, researcher_context_agent]
+  - [researcher_context_agent, governance_service]
+  - [governance_service, human_gate]
+  - [load_context_files, openhands_worker]
+  - [openhands_worker, tester_agent]
+  - [tester_agent, security_reviewer_agent]
+  - [security_reviewer_agent, code_reviewer_agent]
+  - [code_reviewer_agent, release_deploy_agent]
+  - [release_deploy_agent, reviewer_decision]
+  - [read_only_reporter, finalize_workspace]
+  - [reporter, finalize_workspace]
+  - [finalize_workspace, END]
+  - [reporter_end, END]
+
+fanOut:
+  codegraph_context:
+    - intake_user_intent
+    - intake_ambiguity
+    - intake_repo_context
+
+joins:
+  - sources: [intake_user_intent, intake_ambiguity, intake_repo_context]
+    target: intake_synthesizer
+  - sources: [planning_minimal, planning_robust, planning_test_first]
+    target: critique_risk
+  - sources: [planning_minimal, planning_robust, planning_test_first]
+    target: critique_test_coverage
+  - sources: [planning_minimal, planning_robust, planning_test_first]
+    target: critique_security_regression
+  - sources: [critique_risk, critique_test_coverage, critique_security_regression]
+    target: plan_arbiter
+
+routes:
+  human_gate:
+    cases:
+      - when: has_result
+        target: reporter_end
+      - when: read_only
+        target: read_only_reporter
+    default: environment_gate
+
+  environment_gate:
+    cases:
+      - when: has_result
+        target: reporter_end
+    default: load_context_files
+
+  reviewer_decision:
+    cases:
+      - when: worker_error
+        target: reporter
+      - when: review_passed
+        target: reporter
+      - when: can_rework
+        target: openhands_worker
+    default: execution_gate
+
+  execution_gate:
+    default: reporter_end
+
+contextRoutes:
+  intake_user_intent:
+    - task
+    - taskIntent
+    - preflight
+  intake_ambiguity:
+    - task
+    - taskIntent
+    - preflight
+  intake_repo_context:
+    - task
+    - taskIntent
+    - preflight
+    - trustedRepoContext
+    - codegraphContext
+    - longTermMemory
+  intake_synthesizer:
+    - intakeFindings
+  planning_minimal:
+    - taskIntent
+    - problem
+  planning_robust:
+    - taskIntent
+    - problem
+  planning_test_first:
+    - taskIntent
+    - problem
+  critique_risk:
+    - candidatePlans
+  critique_test_coverage:
+    - candidatePlans
+  critique_security_regression:
+    - candidatePlans
+  plan_arbiter:
+    - critiqueFindings
+  researcher_context_agent:
+    - taskGraph
+  governance_service:
+    - researcherContext
+  read_only_reporter:
+    - readOnlyHandoff
+  load_context_files:
+    - workerHandoff
+  openhands_worker:
+    - workerContext
+    - latestReview
+    - governanceDecision
+    - executionEnvironment
+  tester_agent:
+    - workerAttempts
+    - executionEnvironment
+  security_reviewer_agent:
+    - testerResult
+    - executionEnvironment
+  code_reviewer_agent:
+    - securityReview
+  release_deploy_agent:
+    - codeReview
+  reviewer_decision:
+    - releasePlan
+  reporter:
+    - latestReview
+  execution_gate:
+    - task
+    - executionId
+    - correlationId
+    - finalPlan
+    - latestReview
+    - retryCount
+    - reworkCycle

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import telemetry
+from .debug_log import write_debug_event
 
 
 def _now() -> str:
@@ -82,8 +83,13 @@ class SQLiteAgentBroker:
         self.conn.commit()
 
         self._ensure_column("agent_runs", "correlation_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("agent_runs", "execution_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("agent_subtasks", "correlation_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("agent_events", "correlation_id", "TEXT NOT NULL DEFAULT ''")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_execution ON agent_runs(execution_id) WHERE execution_id != ''"
+        )
+        self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -94,13 +100,41 @@ class SQLiteAgentBroker:
     def close(self) -> None:
         self.conn.close()
 
-    def create_run(self, *, session_id: str, task: str, task_graph: dict[str, Any], correlation_id: str | None = None) -> str:
+    def create_run(
+        self,
+        *,
+        session_id: str,
+        task: str,
+        task_graph: dict[str, Any],
+        correlation_id: str | None = None,
+        execution_id: str | None = None,
+    ) -> str:
         run_id = str(uuid.uuid4())
         now = _now()
         cid = telemetry.set_correlation_id(correlation_id)
+        durable_id = str(execution_id or "")
+        if durable_id:
+            existing = self.conn.execute("SELECT id FROM agent_runs WHERE execution_id = ?", (durable_id,)).fetchone()
+            if existing:
+                self.conn.execute(
+                    """
+                    UPDATE agent_runs
+                    SET status = 'running', task_graph_json = ?, correlation_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_json(task_graph), cid, now, existing["id"]),
+                )
+                self.conn.commit()
+                self.record_event(existing["id"], None, "orchestrator", "run_resumed", {"executionId": durable_id})
+                return str(existing["id"])
         self.conn.execute(
-            "INSERT INTO agent_runs (id, session_id, task, task_graph_json, status, created_at, updated_at, correlation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (run_id, session_id, task, _json(task_graph), "running", now, now, cid),
+            """
+            INSERT INTO agent_runs (
+              id, session_id, task, task_graph_json, status, created_at, updated_at,
+              correlation_id, execution_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, session_id, task, _json(task_graph), "running", now, now, cid, durable_id),
         )
         self.conn.commit()
         return run_id
@@ -111,9 +145,16 @@ class SQLiteAgentBroker:
         telemetry.set_correlation_id(cid)
         rows = []
         for subtask in subtasks:
-            subtask_id = str(uuid.uuid4())
             role = str(subtask["role"])
             title = str(subtask.get("title") or role)
+            existing = self.conn.execute(
+                "SELECT * FROM agent_subtasks WHERE run_id = ? AND role = ? AND title = ? ORDER BY created_at LIMIT 1",
+                (run_id, role, title),
+            ).fetchone()
+            if existing:
+                rows.append(self._subtask_dict(existing))
+                continue
+            subtask_id = str(uuid.uuid4())
             self.conn.execute(
                 "INSERT INTO agent_subtasks (id, run_id, role, title, input_json, status, created_at, updated_at, correlation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (subtask_id, run_id, role, title, _json(subtask.get("input")), "queued", now, now, cid),
@@ -196,6 +237,16 @@ class SQLiteAgentBroker:
             )
             self.conn.commit()
             telemetry.record_broker_message(event_type, role)
+            write_debug_event(
+                "broker.message",
+                {
+                    "runId": run_id,
+                    "subtaskId": subtask_id,
+                    "role": role,
+                    "eventType": event_type,
+                    "payload": event_payload,
+                },
+            )
 
     def events(self, run_id: str, limit: int = 80) -> list[dict[str, Any]]:
         rows = self.conn.execute(

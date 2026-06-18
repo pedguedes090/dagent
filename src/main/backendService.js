@@ -42,9 +42,11 @@ class AgentBackendService {
       const fail = (error) => {
         if (settled) return;
         settled = true;
-        this.child = null;
-        this.endpoint = null;
-        this.readyPromise = null;
+        if (this.child === child) {
+          this.child = null;
+          this.endpoint = null;
+          this.readyPromise = null;
+        }
         reject(error instanceof Error ? error : new Error(String(error)));
       };
 
@@ -70,9 +72,11 @@ class AgentBackendService {
 
       child.on("error", fail);
       child.on("exit", (code) => {
-        this.child = null;
-        this.endpoint = null;
-        this.readyPromise = null;
+        if (this.child === child) {
+          this.child = null;
+          this.endpoint = null;
+          this.readyPromise = null;
+        }
         if (!settled) {
           fail(new Error(this.stderr || `Agent backend exited before ready with code ${code}`));
         }
@@ -83,8 +87,54 @@ class AgentBackendService {
   }
 
   async runPipeline({ settings, workspacePath, messages, userText, sessionId, humanGateApproval, emitProgress }) {
-    const endpoint = await this.start();
     const correlationId = humanGateApproval?.correlationId || crypto.randomUUID();
+    const executionId = humanGateApproval?.executionId || crypto.randomUUID();
+    const maxTransportRetries = 1;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= maxTransportRetries; attempt += 1) {
+      try {
+        return await this.requestPipeline({
+          settings,
+          workspacePath,
+          messages,
+          userText,
+          sessionId,
+          humanGateApproval,
+          emitProgress,
+          correlationId,
+          executionId
+        });
+      } catch (error) {
+        lastError = error;
+        const retryable = /fetch failed|socket|connection|terminated|econn|backend exited|khong tra ve ket qua/i.test(String(error?.message || error));
+        if (!retryable || attempt >= maxTransportRetries) throw error;
+        if (typeof emitProgress === "function") {
+          emitProgress({
+            stage: "resume",
+            detail: `Backend connection interrupted; resuming execution ${executionId}`,
+            at: new Date().toISOString()
+          });
+        }
+        this.stop();
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+    }
+    throw lastError || new Error("Agent backend transport retry failed.");
+  }
+
+  async requestPipeline({
+    settings,
+    workspacePath,
+    messages,
+    userText,
+    sessionId,
+    humanGateApproval,
+    emitProgress,
+    correlationId,
+    executionId
+  }) {
+    const endpoint = await this.start();
     const response = await fetch(`${endpoint}/v1/runs`, {
       method: "POST",
       headers: {
@@ -93,6 +143,7 @@ class AgentBackendService {
       },
       body: JSON.stringify({
         sessionId,
+        executionId,
         correlationId,
         content: userText,
         workspacePath,
@@ -145,6 +196,7 @@ class AgentBackendService {
     return {
       ...result,
       id: result.id,
+      executionId: result.executionId || executionId,
       correlationId: result.correlationId || correlationId,
       createdAt: new Date().toISOString(),
       workspacePath,
@@ -153,6 +205,54 @@ class AgentBackendService {
         model: settings.model
       }
     };
+  }
+
+  async getObservability() {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/observability`);
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Agent backend observability loi ${response.status}: ${body.slice(0, 800)}`);
+    }
+    return response.json();
+  }
+
+  async getAutonomyStatus() {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/autonomy/status`);
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Agent backend autonomy status loi ${response.status}: ${body.slice(0, 800)}`);
+    }
+    return response.json();
+  }
+
+  async runAutonomyScan({ workspacePath }) {
+    const endpoint = await this.start();
+    const correlationId = crypto.randomUUID();
+    const response = await fetch(`${endpoint}/v1/autonomy/idle-scan`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Correlation-Id": correlationId
+      },
+      body: JSON.stringify({
+        workspacePath,
+        correlationId
+      })
+    });
+    const body = await response.text().catch(() => "");
+    let payload = null;
+    try {
+      payload = body ? JSON.parse(body) : null;
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) {
+      const message = payload?.error || body.slice(0, 800) || "unknown";
+      throw new Error(`Agent backend autonomy scan loi ${response.status}: ${message}`);
+    }
+    return payload;
   }
 
   stop() {

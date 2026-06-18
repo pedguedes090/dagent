@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
+import urllib.error
 import urllib.request
 from typing import Any
 
 from . import telemetry
+from .durable_execution import cached_tool_call
 
 
 def _chat_url(server_url: str) -> str:
@@ -88,10 +92,53 @@ def _extract_loose_content(raw: str) -> str:
 
 
 class ChatClient:
+    _circuit_state: dict[str, dict[str, Any]] = {}
+
     def __init__(self, server_url: str, model: str, api_key: str = "") -> None:
         self.server_url = server_url
         self.model = model
         self.api_key = api_key
+        self.timeout_seconds = float(os.getenv("AGENT_LLM_TIMEOUT_SECONDS", "180"))
+        self.max_retries = max(0, int(os.getenv("AGENT_LLM_MAX_RETRIES", "2")))
+        self.backoff_seconds = max(0.0, float(os.getenv("AGENT_LLM_BACKOFF_SECONDS", "0.5")))
+        self.circuit_threshold = max(1, int(os.getenv("AGENT_LLM_CIRCUIT_THRESHOLD", "3")))
+        self.circuit_cooldown_seconds = max(1.0, float(os.getenv("AGENT_LLM_CIRCUIT_COOLDOWN_SECONDS", "30")))
+
+    def _circuit_key(self) -> str:
+        return f"{self.server_url.rstrip('/')}::{self.model}"
+
+    def _circuit_open_reason(self) -> str | None:
+        state = self._circuit_state.get(self._circuit_key()) or {}
+        opened_at = float(state.get("openedAt") or 0)
+        if not opened_at:
+            return None
+        elapsed = time.monotonic() - opened_at
+        if elapsed >= self.circuit_cooldown_seconds:
+            self._circuit_state.pop(self._circuit_key(), None)
+            return None
+        return f"LLM circuit is open for {round(self.circuit_cooldown_seconds - elapsed, 1)}s after repeated failures."
+
+    def _record_success(self) -> None:
+        self._circuit_state.pop(self._circuit_key(), None)
+
+    def _record_failure(self, exc: Exception) -> None:
+        key = self._circuit_key()
+        state = self._circuit_state.get(key) or {"failures": 0, "openedAt": 0}
+        failures = int(state.get("failures") or 0) + 1
+        state["failures"] = failures
+        state["lastError"] = str(exc)[:240]
+        if failures >= self.circuit_threshold:
+            state["openedAt"] = time.monotonic()
+        self._circuit_state[key] = state
+
+    def _should_retry(self, exc: Exception) -> bool:
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code == 429 or exc.code >= 500
+        return isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError))
+
+    def _request_raw(self, req: urllib.request.Request) -> str:
+        with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
+            return response.read().decode("utf-8", errors="replace")
 
     def chat(self, messages: list[dict[str, str]], temperature: float = 0.2, json_mode: bool = False) -> str:
         body: dict[str, Any] = {
@@ -114,21 +161,57 @@ class ChatClient:
                 "llm.server_url": self.server_url,
                 "llm.json_mode": json_mode,
                 "llm.message_count": len(messages),
+                "llm.max_retries": self.max_retries,
             },
         ) as span:
+            open_reason = self._circuit_open_reason()
+            if open_reason:
+                telemetry.set_span_attrs(span, {"llm.circuit_open": True})
+                raise RuntimeError(open_reason)
+
             req = urllib.request.Request(
                 _chat_url(self.server_url),
                 data=json.dumps(body).encode("utf-8"),
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=180) as response:
-                raw = response.read().decode("utf-8", errors="replace")
+            retry_count = 0
+
+            def request_with_retry() -> str:
+                nonlocal retry_count
+                for attempt in range(self.max_retries + 1):
+                    retry_count = attempt
+                    try:
+                        response_text = self._request_raw(req)
+                        self._record_success()
+                        return response_text
+                    except Exception as exc:
+                        self._record_failure(exc)
+                        telemetry.set_span_attrs(span, {"llm.retry_count": attempt, "llm.last_error": str(exc)[:240]})
+                        if attempt >= self.max_retries or not self._should_retry(exc):
+                            raise
+                        time.sleep(self.backoff_seconds * (2**attempt))
+                raise RuntimeError("LLM retry loop exited unexpectedly.")
+
+            raw, cache_hit = cached_tool_call(
+                "tool",
+                "llm_chat",
+                {
+                    "serverUrl": self.server_url,
+                    "model": self.model,
+                    "temperature": temperature,
+                    "jsonMode": json_mode,
+                    "messages": messages,
+                },
+                request_with_retry,
+            )
+            raw = str(raw)
+            telemetry.set_span_attrs(span, {"llm.retry_count": retry_count, "llm.cache_hit": cache_hit})
 
             try:
                 payload = json.loads(raw)
                 usage = payload.get("usage") if isinstance(payload, dict) else None
-                if isinstance(usage, dict):
+                if isinstance(usage, dict) and not cache_hit:
                     prompt_tokens = int(usage.get("prompt_tokens") or 0)
                     completion_tokens = int(usage.get("completion_tokens") or 0)
                     total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
@@ -166,7 +249,7 @@ class ChatClient:
                 ],
                 json_mode=True,
             )
-        except ValueError as exc:
+        except Exception as exc:
             return dict(fallback, raw="", jsonParseError=str(exc))
 
         candidates = [text]
