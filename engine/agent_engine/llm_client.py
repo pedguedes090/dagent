@@ -5,6 +5,8 @@ import re
 import urllib.request
 from typing import Any
 
+from . import telemetry
+
 
 def _chat_url(server_url: str) -> str:
     base = str(server_url or "").strip().rstrip("/")
@@ -86,9 +88,10 @@ def _extract_loose_content(raw: str) -> str:
 
 
 class ChatClient:
-    def __init__(self, server_url: str, model: str) -> None:
+    def __init__(self, server_url: str, model: str, api_key: str = "") -> None:
         self.server_url = server_url
         self.model = model
+        self.api_key = api_key
 
     def chat(self, messages: list[dict[str, str]], temperature: float = 0.2, json_mode: bool = False) -> str:
         body: dict[str, Any] = {
@@ -99,25 +102,54 @@ class ChatClient:
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 
-        req = urllib.request.Request(
-            _chat_url(self.server_url),
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=180) as response:
-            raw = response.read().decode("utf-8", errors="replace")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        telemetry.inject_trace_context(headers)
 
-        try:
-            return _extract_text(json.loads(raw))
-        except json.JSONDecodeError:
-            streamed = _extract_sse_text(raw)
-            if streamed:
-                return streamed
-            loose = _extract_loose_content(raw)
-            if loose:
-                return loose
-            raise ValueError(f"Cannot parse model response: {raw[:240]}")
+        with telemetry.start_span(
+            "tool.llm_chat",
+            {
+                "llm.model": self.model,
+                "llm.server_url": self.server_url,
+                "llm.json_mode": json_mode,
+                "llm.message_count": len(messages),
+            },
+        ) as span:
+            req = urllib.request.Request(
+                _chat_url(self.server_url),
+                data=json.dumps(body).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=180) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+
+            try:
+                payload = json.loads(raw)
+                usage = payload.get("usage") if isinstance(payload, dict) else None
+                if isinstance(usage, dict):
+                    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                    completion_tokens = int(usage.get("completion_tokens") or 0)
+                    total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
+                    telemetry.record_token_usage(total_tokens, self.model)
+                    telemetry.set_span_attrs(
+                        span,
+                        {
+                            "llm.usage.prompt_tokens": prompt_tokens,
+                            "llm.usage.completion_tokens": completion_tokens,
+                            "llm.usage.total_tokens": total_tokens,
+                        },
+                    )
+                return _extract_text(payload)
+            except json.JSONDecodeError:
+                streamed = _extract_sse_text(raw)
+                if streamed:
+                    return streamed
+                loose = _extract_loose_content(raw)
+                if loose:
+                    return loose
+                raise ValueError(f"Cannot parse model response: {raw[:240]}")
 
     def json(self, prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
         try:

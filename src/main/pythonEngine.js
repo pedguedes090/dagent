@@ -1,14 +1,5 @@
-const path = require("path");
 const { spawn } = require("child_process");
-
-function getProjectRoot() {
-  return path.resolve(__dirname, "../..");
-}
-
-function getPythonPath(projectRoot) {
-  const venvPython = path.join(projectRoot, ".venv", "Scripts", "python.exe");
-  return venvPython;
-}
+const { buildPythonEnv, getProjectRoot, resolvePythonCommand } = require("./pythonRuntime");
 
 function parseJsonLine(line) {
   try {
@@ -21,24 +12,11 @@ function parseJsonLine(line) {
 function runPythonAgentPipeline({ settings, workspacePath, messages, userText, sessionId, emitProgress }) {
   return new Promise((resolve, reject) => {
     const projectRoot = getProjectRoot();
-    const pythonPath = getPythonPath(projectRoot);
-    const enginePath = path.join(projectRoot, "engine");
-    const localBinPath = path.join(projectRoot, "node_modules", ".bin");
-    const nextPath = process.env.PATH
-      ? `${localBinPath}${path.delimiter}${process.env.PATH}`
-      : localBinPath;
-    const child = spawn(pythonPath, ["-m", "agent_engine.run"], {
+    const python = resolvePythonCommand(projectRoot);
+    const child = spawn(python.command, [...python.args, "-m", "agent_engine.run"], {
       cwd: projectRoot,
       windowsHide: true,
-      env: {
-        ...process.env,
-        PATH: nextPath,
-        CODEGRAPH_TELEMETRY: "0",
-        OPENHANDS_SUPPRESS_BANNER: "1",
-        PYTHONIOENCODING: "utf-8",
-        PYTHONUTF8: "1",
-        PYTHONPATH: process.env.PYTHONPATH ? `${enginePath}${path.delimiter}${process.env.PYTHONPATH}` : enginePath
-      }
+      env: buildPythonEnv({ projectRoot })
     });
 
     let stdoutBuffer = "";

@@ -25,6 +25,7 @@ def emit(stage: str, detail: str) -> None:
 
 def main() -> int:
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
+    os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):

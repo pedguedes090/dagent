@@ -1,11 +1,14 @@
 const path = require("path");
 const crypto = require("crypto");
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { AppDatabase } = require("./appDatabase");
+const { AgentBackendService } = require("./backendService");
 const { SettingsStore } = require("./settingsStore");
 const { SessionStore } = require("./sessionStore");
-const { runPythonAgentPipeline } = require("./pythonEngine");
 
 let mainWindow;
+let appDatabase;
+let backendService;
 let settingsStore;
 let sessionStore;
 const activeRuns = new Set();
@@ -21,7 +24,15 @@ function findPendingHumanGateTask(session) {
     const run = runs[index];
     if (run?.humanGate?.status !== "pending") continue;
     const task = run.humanGate.originalTask || run.task || run.problem?.problemStatement;
-    if (task) return { task: String(task), runIndex: index };
+    if (task) {
+      return {
+        ...run.humanGate,
+        task: String(task),
+        originalTask: String(task),
+        correlationId: run.humanGate.correlationId || run.correlationId || null,
+        runIndex: index
+      };
+    }
   }
   return null;
 }
@@ -114,9 +125,11 @@ function registerIpc() {
     }
 
     const originalContent = String(payload?.content || "").trim();
-    const pendingHumanGate = isConfirmationText(originalContent) ? findPendingHumanGateTask(session) : null;
+    const pendingHumanGate = isConfirmationText(originalContent)
+      ? sessionStore.getPendingApproval(session.id) || findPendingHumanGateTask(session)
+      : null;
     const engineContent = pendingHumanGate
-      ? `${pendingHumanGate.task}\n\nxác nhận`
+      ? pendingHumanGate.originalTask || pendingHumanGate.task
       : originalContent;
 
     const userMessage = {
@@ -128,7 +141,12 @@ function registerIpc() {
     if (!userMessage.content) throw new Error("Bạn chưa nhập yêu cầu.");
 
     session.workspacePath = payload?.workspacePath || session.workspacePath || "";
-    if (pendingHumanGate && Array.isArray(session.runs)) {
+    let approvedAt = null;
+    if (pendingHumanGate?.id) {
+      approvedAt = sessionStore.approvePendingApproval(session.id, pendingHumanGate.id);
+      session = sessionStore.get(session.id) || session;
+    } else if (pendingHumanGate && Array.isArray(session.runs)) {
+      approvedAt = new Date().toISOString();
       session.runs = session.runs.map((run, index) =>
         index === pendingHumanGate.runIndex
           ? {
@@ -136,7 +154,7 @@ function registerIpc() {
               humanGate: {
                 ...run.humanGate,
                 status: "approved",
-                approvedAt: new Date().toISOString()
+                approvedAt
               }
             }
           : run
@@ -161,12 +179,24 @@ function registerIpc() {
     }
 
     try {
-      const run = await runPythonAgentPipeline({
+      const run = await backendService.runPipeline({
         settings,
         workspacePath: session.workspacePath,
         messages: session.messages,
         userText: engineContent,
         sessionId: session.id,
+        humanGateApproval: pendingHumanGate
+          ? {
+              status: "approved",
+              id: pendingHumanGate.id || null,
+              createdAt: pendingHumanGate.createdAt || null,
+              approvedAt,
+              correlationId: pendingHumanGate.correlationId || null,
+              originalTask: pendingHumanGate.originalTask || pendingHumanGate.task,
+              riskClass: pendingHumanGate.riskClass || "high",
+              reason: pendingHumanGate.reason || ""
+            }
+          : null,
         emitProgress
       });
 
@@ -220,15 +250,26 @@ function registerIpc() {
   });
 }
 
-app.whenReady().then(() => {
-  settingsStore = new SettingsStore(app.getPath("userData"));
-  sessionStore = new SessionStore(app.getPath("userData"));
+app.whenReady().then(async () => {
+  const userDataPath = app.getPath("userData");
+  appDatabase = new AppDatabase(userDataPath);
+  settingsStore = new SettingsStore(appDatabase, userDataPath);
+  sessionStore = new SessionStore(appDatabase, userDataPath);
+  backendService = new AgentBackendService(userDataPath);
   registerIpc();
   createWindow();
+  backendService.start().catch((error) => {
+    console.error("Agent backend failed to start:", error);
+  });
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on("before-quit", () => {
+  backendService?.stop();
+  appDatabase?.close();
 });
 
 app.on("window-all-closed", () => {

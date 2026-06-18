@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
+
+from . import telemetry
 
 TEXT_EXTENSIONS = {
     ".c",
@@ -83,7 +87,8 @@ def read_file(workspace: str, relative_path: str, max_chars: int = 20000) -> str
     target = (root / relative_path).resolve()
     if root not in target.parents and target != root:
         raise ValueError(f"Path escapes workspace: {relative_path}")
-    text = target.read_text(encoding="utf-8", errors="replace")
+    with telemetry.start_span("tool.file_read", {"tool.file.path": relative_path, "workspace.path": str(root)}):
+        text = target.read_text(encoding="utf-8", errors="replace")
     if len(text) > max_chars:
         return text[:max_chars] + f"\n\n...[truncated {len(text) - max_chars} chars]"
     return text
@@ -145,26 +150,30 @@ def _run_codegraph(workspace: str, args: list[str], timeout: int = 45) -> dict[s
         "CODEGRAPH_TELEMETRY": "0",
         "NO_COLOR": "1",
     }
-    try:
-        proc = subprocess.run(
-            [binary, *args],
-            cwd=str(Path(workspace).resolve()),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return {
-            "ok": proc.returncode == 0,
-            "status": "ok" if proc.returncode == 0 else "error",
-            "code": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "status": "timeout", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
-    except Exception as exc:
-        return {"ok": False, "status": "error", "reason": str(exc)}
+    with telemetry.start_span("tool.codegraph", {"tool.name": "codegraph", "tool.args": " ".join(args), "workspace.path": str(Path(workspace).resolve())}) as span:
+        try:
+            proc = subprocess.run(
+                [binary, *args],
+                cwd=str(Path(workspace).resolve()),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
+            return {
+                "ok": proc.returncode == 0,
+                "status": "ok" if proc.returncode == 0 else "error",
+                "code": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+        except subprocess.TimeoutExpired as exc:
+            telemetry.set_span_attrs(span, {"tool.timed_out": True})
+            return {"ok": False, "status": "timeout", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
+        except Exception as exc:
+            telemetry.set_span_attrs(span, {"tool.error": str(exc)})
+            return {"ok": False, "status": "error", "reason": str(exc)}
 
 
 def _trim_text(value: Any, max_chars: int = 4000) -> str:
@@ -294,14 +303,24 @@ def file_hashes(workspace: str) -> dict[str, str]:
     root = Path(workspace).resolve()
     hashes: dict[str, str] = {}
     for item in walk_workspace(workspace, max_files=1000, max_depth=8):
-        if not item.get("text"):
-            continue
         path = root / item["path"]
         try:
             hashes[item["path"]] = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
             continue
     return hashes
+
+
+def file_snapshots(workspace: str) -> dict[str, bytes]:
+    root = Path(workspace).resolve()
+    snapshots: dict[str, bytes] = {}
+    for item in walk_workspace(workspace, max_files=1000, max_depth=8):
+        path = root / item["path"]
+        try:
+            snapshots[item["path"]] = path.read_bytes()
+        except OSError:
+            continue
+    return snapshots
 
 
 def changed_files(before: dict[str, str], after: dict[str, str]) -> list[dict[str, Any]]:
@@ -317,6 +336,69 @@ def changed_files(before: dict[str, str], after: dict[str, str]) -> list[dict[st
             status = "modified"
         changes.append({"path": path, "status": status})
     return changes
+
+
+def _normalize_policy_path(value: Any) -> str:
+    return str(value or "").replace("\\", "/").strip().lstrip("./").strip("/")
+
+
+def _matches_policy(path: str, patterns: list[str]) -> bool:
+    normalized_path = _normalize_policy_path(path)
+    for raw in patterns:
+        pattern = _normalize_policy_path(raw)
+        if not pattern:
+            continue
+        if pattern == normalized_path:
+            return True
+        if pattern.endswith("/**") and (normalized_path == pattern[:-3] or normalized_path.startswith(pattern[:-2])):
+            return True
+        if fnmatch.fnmatch(normalized_path, pattern):
+            return True
+    return False
+
+
+def enforce_change_policy(
+    workspace: str,
+    before_snapshots: dict[str, bytes],
+    allowed_patterns: list[str],
+    forbidden_patterns: list[str] | None = None,
+) -> dict[str, Any]:
+    root = Path(workspace).resolve()
+    before_hashes = {path: hashlib.sha256(content).hexdigest() for path, content in before_snapshots.items()}
+    after_hashes = file_hashes(workspace)
+    changes = changed_files(before_hashes, after_hashes)
+    forbidden_patterns = forbidden_patterns or []
+    violations = []
+
+    for change in changes:
+        path = _normalize_policy_path(change.get("path"))
+        allowed = bool(allowed_patterns) and _matches_policy(path, allowed_patterns)
+        forbidden = _matches_policy(path, forbidden_patterns)
+        if allowed and not forbidden:
+            continue
+        violations.append(
+            {
+                **change,
+                "reason": "forbiddenPath" if forbidden else "outsideAllowedFiles",
+            }
+        )
+
+    for violation in violations:
+        rel = _normalize_policy_path(violation.get("path"))
+        target = (root / rel).resolve()
+        if target != root and root not in target.parents:
+            continue
+        if rel in before_snapshots:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(before_snapshots[rel])
+        elif target.exists() and target.is_file():
+            target.unlink()
+
+    final_hashes = file_hashes(workspace)
+    return {
+        "changedFiles": changed_files(before_hashes, final_hashes),
+        "violations": violations,
+    }
 
 
 def find_project_roots(workspace: str) -> list[str]:
@@ -346,6 +428,52 @@ def _path_inside_workspace(workspace: str, relative_path: str) -> bool:
     root = Path(workspace).resolve()
     target = (root / relative_path).resolve()
     return target == root or root in target.parents
+
+
+def create_workspace_sandbox(workspace: str) -> tempfile.TemporaryDirectory[str]:
+    source = Path(workspace).resolve()
+    temp = tempfile.TemporaryDirectory(prefix="hethongagent-sandbox-")
+    sandbox_root = Path(temp.name) / "workspace"
+
+    def ignore(_dir: str, names: list[str]) -> set[str]:
+        return {name for name in names if name in IGNORED_DIRS}
+
+    with telemetry.start_span("sandbox.create", {"workspace.path": str(source), "sandbox.path": str(sandbox_root)}):
+        try:
+            shutil.copytree(source, sandbox_root, ignore=ignore)
+            return temp
+        except Exception as exc:
+            telemetry.record_sandbox_failure(exc.__class__.__name__)
+            temp.cleanup()
+            raise
+
+
+def apply_sandbox_changes(source_workspace: str, sandbox_workspace: str, changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_root = Path(source_workspace).resolve()
+    sandbox_root = Path(sandbox_workspace).resolve()
+    applied = []
+    with telemetry.start_span("sandbox.merge", {"workspace.path": str(source_root), "sandbox.path": str(sandbox_root), "change.count": len(changes)}):
+        for change in changes:
+            rel = _normalize_policy_path(change.get("path"))
+            if not rel:
+                continue
+            source_target = (source_root / rel).resolve()
+            sandbox_target = (sandbox_root / rel).resolve()
+            if source_target != source_root and source_root not in source_target.parents:
+                continue
+            if sandbox_target != sandbox_root and sandbox_root not in sandbox_target.parents:
+                continue
+            status = change.get("status")
+            if status == "deleted":
+                if source_target.exists() and source_target.is_file():
+                    source_target.unlink()
+                    applied.append(change)
+                continue
+            if sandbox_target.exists() and sandbox_target.is_file():
+                source_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(sandbox_target, source_target)
+                applied.append(change)
+    return applied
 
 
 def pick_execution_root(workspace: str, worker_result: dict[str, Any] | None = None, spec: dict[str, Any] | None = None) -> str:
@@ -452,22 +580,54 @@ def is_safe_command(command: str) -> bool:
     return lower.startswith(("pytest", "go test", "cargo test", "dotnet test", "mvn test", "gradle test"))
 
 
-def run_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".") -> dict[str, Any]:
-    if not is_safe_command(command):
-        return {"command": command, "cwd": cwd, "skipped": True, "reason": "Command is not in verification allowlist."}
+def run_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".", sandboxed: bool = False) -> dict[str, Any]:
     root = Path(workspace).resolve()
-    workdir = root if cwd == "." else (root / cwd).resolve()
-    if workdir != root and root not in workdir.parents:
-        return {"command": command, "cwd": cwd, "skipped": True, "reason": "Command cwd escapes workspace."}
-    try:
-        proc = subprocess.run(command, cwd=str(workdir), shell=True, capture_output=True, text=True, timeout=timeout)
-        return {
-            "command": command,
-            "cwd": cwd,
-            "code": proc.returncode,
-            "stdout": proc.stdout[-20000:],
-            "stderr": proc.stderr[-20000:],
-            "timedOut": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {"command": command, "cwd": cwd, "code": None, "stdout": exc.stdout or "", "stderr": exc.stderr or "", "timedOut": True}
+    with telemetry.start_span(
+        "tool.command",
+        {
+            "tool.command": command,
+            "tool.cwd": cwd,
+            "tool.sandboxed": sandboxed,
+            "workspace.path": str(root),
+        },
+    ) as span:
+        if not is_safe_command(command):
+            telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "verification_allowlist"})
+            return {"command": command, "cwd": cwd, "skipped": True, "reason": "Command is not in verification allowlist."}
+        workdir = root if cwd == "." else (root / cwd).resolve()
+        if workdir != root and root not in workdir.parents:
+            telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "cwd_escape"})
+            return {"command": command, "cwd": cwd, "skipped": True, "reason": "Command cwd escapes workspace."}
+        try:
+            proc = subprocess.run(command, cwd=str(workdir), shell=True, capture_output=True, text=True, timeout=timeout)
+            telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
+            return {
+                "command": command,
+                "cwd": cwd,
+                "code": proc.returncode,
+                "stdout": proc.stdout[-20000:],
+                "stderr": proc.stderr[-20000:],
+                "timedOut": False,
+            }
+        except subprocess.TimeoutExpired as exc:
+            telemetry.set_span_attrs(span, {"tool.exit_code": -1, "tool.timed_out": True})
+            if sandboxed:
+                telemetry.record_sandbox_failure("command_timeout")
+            return {"command": command, "cwd": cwd, "code": None, "stdout": exc.stdout or "", "stderr": exc.stderr or "", "timedOut": True}
+        except Exception as exc:
+            telemetry.set_span_attrs(span, {"tool.error": str(exc)})
+            if sandboxed:
+                telemetry.record_sandbox_failure(exc.__class__.__name__)
+            return {"command": command, "cwd": cwd, "code": None, "stdout": "", "stderr": str(exc), "timedOut": False}
+
+
+def run_sandboxed_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".") -> dict[str, Any]:
+    with telemetry.start_span("sandbox.command", {"tool.command": command, "tool.cwd": cwd, "workspace.path": str(Path(workspace).resolve())}):
+        try:
+            with create_workspace_sandbox(workspace) as temp_dir:
+                sandbox_workspace = str(Path(temp_dir) / "workspace")
+                result = run_command(sandbox_workspace, command, timeout=timeout, cwd=cwd, sandboxed=True)
+                return {**result, "sandboxed": True}
+        except Exception as exc:
+            telemetry.record_sandbox_failure(exc.__class__.__name__)
+            return {"command": command, "cwd": cwd, "code": None, "stdout": "", "stderr": str(exc), "timedOut": False, "sandboxed": True}

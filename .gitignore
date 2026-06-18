@@ -1,5 +1,6 @@
 node_modules/
 .codegraph/
+.agent-state/
 dist/
 out/
 __pycache__/

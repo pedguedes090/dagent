@@ -1,0 +1,200 @@
+{
+  "id": "hethongagent-internal-v1",
+  "version": "2026-06-18",
+  "description": "Local benchmark for safe evaluation-driven improvement before enabling online adaptation.",
+  "rubric": {
+    "functional_correctness": 0.35,
+    "diff_minimality": 0.15,
+    "test_pass": 0.2,
+    "security_regressions": 0.15,
+    "latency": 0.075,
+    "cost": 0.075
+  },
+  "latencyTargetMs": 600000,
+  "tokenBudget": 180000,
+  "cases": [
+    {
+      "id": "read_only_repo_summary",
+      "category": "read-only",
+      "title": "Read-only repository summary",
+      "task": "Read README.md and summarize the architecture in Vietnamese. Do not modify any file.",
+      "files": {
+        "README.md": "# Sample Agent\n\nThe app has an Electron UI, a Python backend service, SQLite state, and a LangGraph pipeline."
+      },
+      "expected": {
+        "assistantContains": ["Electron", "Python", "SQLite"],
+        "maxChangedFiles": 0,
+        "forbiddenChangedFiles": ["**"]
+      },
+      "verificationCommands": [],
+      "solutionFiles": {},
+      "mockResult": {
+        "assistantText": "Ung dung gom Electron UI, backend Python, SQLite state va LangGraph pipeline.",
+        "changedFiles": [],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    },
+    {
+      "id": "bugfix_zero_division",
+      "category": "bugfix",
+      "title": "Fix incorrect divide-by-zero behavior",
+      "task": "Fix calculator.divide so divide-by-zero raises ZeroDivisionError while preserving normal division.",
+      "files": {
+        "calculator.py": "def divide(a, b):\n    return 0 if b == 0 else a / b\n",
+        "test_calculator.py": "import unittest\n\nfrom calculator import divide\n\n\nclass DivideTests(unittest.TestCase):\n    def test_normal_division(self):\n        self.assertEqual(divide(8, 2), 4)\n\n    def test_zero_division(self):\n        with self.assertRaises(ZeroDivisionError):\n            divide(1, 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "expected": {
+        "requiredChangedFiles": ["calculator.py"],
+        "maxChangedFiles": 1,
+        "requiredFileContains": [{"path": "calculator.py", "contains": "return a / b"}]
+      },
+      "verificationCommands": ["{python} -m unittest"],
+      "solutionFiles": {
+        "calculator.py": "def divide(a, b):\n    return a / b\n"
+      },
+      "mockResult": {
+        "assistantText": "Fixed divide-by-zero handling.",
+        "changedFiles": [{"path": "calculator.py", "status": "modified"}],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    },
+    {
+      "id": "refactor_discount_logic",
+      "category": "refactor",
+      "title": "Refactor duplicated discount logic",
+      "task": "Refactor pricing.py to remove duplicated premium-discount math without changing behavior.",
+      "files": {
+        "pricing.py": "def invoice_total(subtotal, premium=False):\n    if premium:\n        return round(subtotal - subtotal * 0.1, 2)\n    return round(subtotal, 2)\n\n\ndef renewal_total(subtotal, premium=False):\n    if premium:\n        return round(subtotal - subtotal * 0.1, 2)\n    return round(subtotal, 2)\n",
+        "test_pricing.py": "import unittest\n\nfrom pricing import invoice_total, renewal_total\n\n\nclass PricingTests(unittest.TestCase):\n    def test_invoice(self):\n        self.assertEqual(invoice_total(100, True), 90)\n        self.assertEqual(invoice_total(100, False), 100)\n\n    def test_renewal(self):\n        self.assertEqual(renewal_total(80, True), 72)\n        self.assertEqual(renewal_total(80, False), 80)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "expected": {
+        "requiredChangedFiles": ["pricing.py"],
+        "maxChangedFiles": 1,
+        "requiredFileContains": [{"path": "pricing.py", "contains": "def _apply_premium_discount"}]
+      },
+      "verificationCommands": ["{python} -m unittest"],
+      "solutionFiles": {
+        "pricing.py": "def _apply_premium_discount(subtotal, premium=False):\n    if premium:\n        subtotal = subtotal - subtotal * 0.1\n    return round(subtotal, 2)\n\n\ndef invoice_total(subtotal, premium=False):\n    return _apply_premium_discount(subtotal, premium)\n\n\ndef renewal_total(subtotal, premium=False):\n    return _apply_premium_discount(subtotal, premium)\n"
+      },
+      "mockResult": {
+        "assistantText": "Refactored duplicated discount logic.",
+        "changedFiles": [{"path": "pricing.py", "status": "modified"}],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    },
+    {
+      "id": "scaffold_minimal_node_project",
+      "category": "scaffold-project",
+      "title": "Scaffold a minimal Node project",
+      "task": "Create a minimal Node project with package.json and src/app.js. Do not start a dev server.",
+      "files": {
+        "README.md": "# Empty Workspace\n"
+      },
+      "expected": {
+        "requiredChangedFiles": ["package.json", "src/app.js"],
+        "maxChangedFiles": 3,
+        "requiredFileContains": [
+          {"path": "package.json", "contains": "\"check\""},
+          {"path": "src/app.js", "contains": "function main"}
+        ]
+      },
+      "verificationCommands": ["node --check src/app.js"],
+      "solutionFiles": {
+        "package.json": "{\n  \"name\": \"benchmark-app\",\n  \"version\": \"1.0.0\",\n  \"type\": \"commonjs\",\n  \"scripts\": {\n    \"check\": \"node --check src/app.js\"\n  }\n}\n",
+        "src/app.js": "function main() {\n  return 'benchmark ready';\n}\n\nmodule.exports = { main };\n"
+      },
+      "mockResult": {
+        "assistantText": "Scaffolded a minimal Node project.",
+        "changedFiles": [
+          {"path": "package.json", "status": "created"},
+          {"path": "src/app.js", "status": "created"}
+        ],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    },
+    {
+      "id": "security_patch_remove_eval",
+      "category": "security-patch",
+      "title": "Remove unsafe eval parsing",
+      "task": "Patch server.js to parse user JSON without eval and preserve exports.",
+      "files": {
+        "server.js": "function parseUser(input) {\n  return eval('(' + input + ')');\n}\n\nmodule.exports = { parseUser };\n"
+      },
+      "expected": {
+        "requiredChangedFiles": ["server.js"],
+        "maxChangedFiles": 1,
+        "requiredFileContains": [{"path": "server.js", "contains": "JSON.parse"}],
+        "forbiddenContentPatterns": ["eval\\s*\\("]
+      },
+      "verificationCommands": ["node --check server.js"],
+      "solutionFiles": {
+        "server.js": "function parseUser(input) {\n  return JSON.parse(input);\n}\n\nmodule.exports = { parseUser };\n"
+      },
+      "mockResult": {
+        "assistantText": "Replaced eval parsing with JSON.parse.",
+        "changedFiles": [{"path": "server.js", "status": "modified"}],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    },
+    {
+      "id": "migration_json_to_sqlite",
+      "category": "migration",
+      "title": "Migrate local task state from JSON to SQLite",
+      "task": "Migrate storage.py from JSON-file state to sqlite3-backed task storage while keeping the public save_task/load_tasks functions.",
+      "files": {
+        "storage.py": "import json\nfrom pathlib import Path\n\nSTATE_FILE = Path('tasks.json')\n\n\ndef save_task(task):\n    tasks = load_tasks()\n    tasks.append(task)\n    STATE_FILE.write_text(json.dumps(tasks), encoding='utf-8')\n\n\ndef load_tasks():\n    if not STATE_FILE.exists():\n        return []\n    return json.loads(STATE_FILE.read_text(encoding='utf-8'))\n"
+      },
+      "expected": {
+        "requiredChangedFiles": ["storage.py"],
+        "maxChangedFiles": 1,
+        "requiredFileContains": [
+          {"path": "storage.py", "contains": "sqlite3"},
+          {"path": "storage.py", "contains": "CREATE TABLE IF NOT EXISTS tasks"}
+        ],
+        "forbiddenContentPatterns": ["STATE_FILE", "tasks\\.json", "write_text\\(json"]
+      },
+      "verificationCommands": ["{python} -m compileall ."],
+      "solutionFiles": {
+        "storage.py": "import json\nimport sqlite3\nfrom pathlib import Path\n\nDB_PATH = Path('tasks.sqlite')\n\n\ndef _connect():\n    conn = sqlite3.connect(DB_PATH)\n    conn.execute('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)')\n    return conn\n\n\ndef save_task(task):\n    with _connect() as conn:\n        conn.execute('INSERT INTO tasks (payload) VALUES (?)', (json.dumps(task),))\n\n\ndef load_tasks():\n    with _connect() as conn:\n        rows = conn.execute('SELECT payload FROM tasks ORDER BY id').fetchall()\n    return [json.loads(row[0]) for row in rows]\n"
+      },
+      "mockResult": {
+        "assistantText": "Migrated task state from JSON file storage to sqlite3.",
+        "changedFiles": [{"path": "storage.py", "status": "modified"}],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    },
+    {
+      "id": "ci_repair_typo",
+      "category": "ci-repair",
+      "title": "Repair CI command typo",
+      "task": "Fix the GitHub Actions workflow so it runs the existing npm check script.",
+      "files": {
+        "package.json": "{\n  \"name\": \"ci-fixture\",\n  \"scripts\": {\n    \"check\": \"node --check src/index.js\"\n  }\n}\n",
+        "src/index.js": "function ok() { return true; }\nmodule.exports = { ok };\n",
+        ".github/workflows/ci.yml": "name: ci\non: [push]\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm run chekc\n"
+      },
+      "expected": {
+        "requiredChangedFiles": [".github/workflows/ci.yml"],
+        "maxChangedFiles": 1,
+        "requiredFileContains": [{"path": ".github/workflows/ci.yml", "contains": "npm run check"}],
+        "forbiddenContentPatterns": ["npm run chekc"]
+      },
+      "verificationCommands": ["node --check src/index.js"],
+      "solutionFiles": {
+        ".github/workflows/ci.yml": "name: ci\non: [push]\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm run check\n"
+      },
+      "mockResult": {
+        "assistantText": "Fixed the CI workflow command typo.",
+        "changedFiles": [{"path": ".github/workflows/ci.yml", "status": "modified"}],
+        "commandResults": [],
+        "review": {"passed": true}
+      }
+    }
+  ]
+}

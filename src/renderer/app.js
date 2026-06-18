@@ -18,6 +18,7 @@ const elements = {
   newSessionBtn: document.querySelector("#newSessionBtn"),
   serverInput: document.querySelector("#serverInput"),
   modelInput: document.querySelector("#modelInput"),
+  apiKeyInput: document.querySelector("#apiKeyInput"),
   autoConfirmInput: document.querySelector("#autoConfirmInput"),
   saveSettingsBtn: document.querySelector("#saveSettingsBtn"),
   saveStatus: document.querySelector("#saveStatus"),
@@ -101,6 +102,7 @@ function setStatus(text, timeout = 1800) {
 function renderSettings() {
   elements.serverInput.value = state.settings?.serverUrl || "";
   elements.modelInput.value = state.settings?.model || "";
+  elements.apiKeyInput.value = state.settings?.apiKey || "";
   elements.autoConfirmInput.checked = Boolean(state.settings?.autoConfirmHumanGate);
 }
 
@@ -212,6 +214,7 @@ function renderControls() {
   elements.saveSettingsBtn.disabled = disabled;
   elements.serverInput.disabled = disabled;
   elements.modelInput.disabled = disabled;
+  elements.apiKeyInput.disabled = disabled;
   elements.autoConfirmInput.disabled = disabled;
   elements.messageInput.disabled = disabled;
   elements.sendBtn.disabled = disabled;
@@ -238,6 +241,7 @@ async function saveSettings() {
   state.settings = await appApi.saveSettings({
     serverUrl: elements.serverInput.value,
     model: elements.modelInput.value,
+    apiKey: elements.apiKeyInput.value,
     autoConfirmHumanGate: elements.autoConfirmInput.checked
   });
   renderSettings();

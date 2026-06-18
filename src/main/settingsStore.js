@@ -1,9 +1,11 @@
 const fs = require("fs");
 const path = require("path");
+const { parseJson } = require("./appDatabase");
 
 const DEFAULT_SETTINGS = {
   serverUrl: "http://localhost:20128/v1",
   model: "gemini/gemini-3.1-flash-lite",
+  apiKey: "",
   autoConfirmHumanGate: false
 };
 
@@ -26,12 +28,22 @@ function writeJson(filePath, value) {
 }
 
 class SettingsStore {
-  constructor(userDataPath) {
-    this.filePath = path.join(userDataPath, "settings.json");
+  constructor(database, userDataPath) {
+    this.database = database;
+    this.legacyFilePath = path.join(userDataPath, "settings.json");
+    this.migrateLegacyJson();
+  }
+
+  migrateLegacyJson() {
+    if (this.database.getJsonSetting("modelConfig")) return;
+    const legacy = readJson(this.legacyFilePath, null);
+    if (legacy && typeof legacy === "object") {
+      this.database.setJsonSetting("modelConfig", legacy);
+    }
   }
 
   get() {
-    const stored = readJson(this.filePath, {});
+    const stored = this.database.getJsonSetting("modelConfig", {});
     return {
       ...DEFAULT_SETTINGS,
       ...stored
@@ -43,13 +55,14 @@ class SettingsStore {
     const cleaned = {
       serverUrl: String(nextSettings.serverUrl || current.serverUrl).trim().replace(/\/+$/, ""),
       model: String(nextSettings.model || current.model).trim(),
+      apiKey: String(nextSettings.apiKey ?? current.apiKey ?? "").trim(),
       autoConfirmHumanGate: Boolean(nextSettings.autoConfirmHumanGate)
     };
     const finalSettings = {
       ...DEFAULT_SETTINGS,
       ...cleaned
     };
-    writeJson(this.filePath, finalSettings);
+    this.database.setJsonSetting("modelConfig", finalSettings);
     return finalSettings;
   }
 }

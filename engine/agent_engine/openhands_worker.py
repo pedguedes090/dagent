@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .workspace import changed_files, file_hashes
+from . import telemetry
+from .workspace import apply_sandbox_changes, create_workspace_sandbox, enforce_change_policy, file_snapshots
 
 
 def _safe_model_dump(value: Any) -> Any:
@@ -175,12 +176,12 @@ def run_openhands_worker(
     workspace: str,
     server_url: str,
     model: str,
+    api_key: str,
     worker_task_spec: dict[str, Any],
     rework_context: dict[str, Any] | None,
     emit: Callable[[str, str], None],
 ) -> dict[str, Any]:
-    before = file_hashes(workspace)
-    emit("openhands_worker", "Starting OpenHands SDK single writer")
+    emit("coder_agent", "Starting sandboxed OpenHands coding agent")
 
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
@@ -200,6 +201,15 @@ def run_openhands_worker(
 
     def on_event(event: Any) -> None:
         stage, detail = _event_summary(event)
+        with telemetry.start_span(
+            "tool.openhands_event",
+            {
+                "openhands.stage": stage,
+                "openhands.detail": detail[:500],
+                "agent.role": "coder",
+            },
+        ):
+            pass
         events.append(f"{stage}: {detail}")
         emit(stage, detail)
 
@@ -211,7 +221,7 @@ def run_openhands_worker(
 
     llm = LLM(
         model=openhands_model,
-        api_key=os.getenv("LLM_API_KEY", "local-no-key"),
+        api_key=api_key or os.getenv("LLM_API_KEY", "local-no-key"),
         base_url=server_url,
         stream=False,
         timeout=300,
@@ -233,7 +243,7 @@ def run_openhands_worker(
         ],
     )
     task = (
-        "You are the single coding writer in a LangGraph orchestrated pipeline.\n"
+        "You are the Coder Agent in a multi-agent LangGraph pipeline.\n"
         "Follow this worker task spec exactly. Do not edit files outside allowedFiles. "
         "Do not create tests unless the spec explicitly asks for tests. "
         "If codegraphContext is enabled, use it as code data for orientation and impact analysis; "
@@ -241,33 +251,68 @@ def run_openhands_worker(
         f"WORKER_TASK_SPEC:\n{worker_task_spec}\n\n"
         f"REWORK_CONTEXT:\n{rework_context or {}}\n"
     )
-    conversation = Conversation(
-        agent=agent,
-        workspace=workspace,
-        plugins=plugins or None,
-        callbacks=[on_event],
-        max_iteration_per_run=80,
-        visualizer=None,
-        delete_on_close=False,
-    )
-    try:
-        conversation.send_message(task)
-        run_result = conversation.run()
-    except Exception as exc:
-        after = file_hashes(workspace)
-        return {
-            "summary": "OpenHands worker failed.",
-            "error": str(exc),
-            "model": openhands_model,
-            "changedFiles": changed_files(before, after),
-            "events": events[-120:],
-        }
-    after = file_hashes(workspace)
-    files = changed_files(before, after)
+    with create_workspace_sandbox(workspace) as temp_dir:
+        sandbox_workspace = str(Path(temp_dir) / "workspace")
+        before_snapshot = file_snapshots(sandbox_workspace)
+        emit("coder_agent", "Sandbox workspace ready")
+        conversation = Conversation(
+            agent=agent,
+            workspace=sandbox_workspace,
+            plugins=plugins or None,
+            callbacks=[on_event],
+            max_iteration_per_run=80,
+            visualizer=None,
+            delete_on_close=False,
+        )
+        try:
+            with telemetry.start_span(
+                "tool.openhands_conversation",
+                {
+                    "agent.role": "coder",
+                    "llm.model": openhands_model,
+                    "workspace.path": sandbox_workspace,
+                },
+            ):
+                conversation.send_message(task)
+                run_result = conversation.run()
+        except Exception as exc:
+            policy = enforce_change_policy(
+                sandbox_workspace,
+                before_snapshot,
+                list(worker_task_spec.get("allowedFiles") or []),
+                list(worker_task_spec.get("forbiddenPaths") or []),
+            )
+            applied = apply_sandbox_changes(workspace, sandbox_workspace, policy["changedFiles"])
+            return {
+                "summary": "Coder agent failed inside sandbox.",
+                "error": str(exc),
+                "model": openhands_model,
+                "changedFiles": applied,
+                "policyViolations": policy["violations"],
+                "sandboxed": True,
+                "events": events[-120:],
+            }
+        policy = enforce_change_policy(
+            sandbox_workspace,
+            before_snapshot,
+            list(worker_task_spec.get("allowedFiles") or []),
+            list(worker_task_spec.get("forbiddenPaths") or []),
+        )
+        files = policy["changedFiles"]
+        violations = policy["violations"]
+        applied = apply_sandbox_changes(workspace, sandbox_workspace, files)
+    summary = "Coder agent completed in sandbox."
+    error = None
+    if violations:
+        summary = "Coder agent changes were filtered by allowedFiles policy."
+        error = "Coder attempted to change files outside allowedFiles or inside forbiddenPaths."
     return {
-        "summary": "OpenHands worker completed.",
+        "summary": summary,
+        "error": error,
         "model": openhands_model,
         "rawResult": str(run_result)[:4000],
-        "changedFiles": files,
+        "changedFiles": applied,
+        "policyViolations": violations,
+        "sandboxed": True,
         "events": events[-120:],
     }
