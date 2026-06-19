@@ -28,7 +28,7 @@ const WORKFLOW_GROUPS = [
   },
   {
     title: "Execution",
-    stages: ["load_context_files", "openhands_worker", "tester_agent"]
+    stages: ["workspace_mode", "load_context_files", "setup_commands", "openhands_worker", "tester_agent"]
   },
   {
     title: "Review",
@@ -62,8 +62,10 @@ const STAGE_LABELS = {
   governance_service: "Governance",
   human_gate: "Human gate",
   environment_gate: "Environment gate",
+  workspace_mode: "Workspace mode",
   load_context_files: "Context files",
   context: "Context",
+  setup_commands: "Setup & install",
   openhands_worker: "OpenHands coder",
   openhands_context: "OpenHands context",
   openhands_plugins: "Plugins",
@@ -97,6 +99,7 @@ const elements = {
   modelInput: document.querySelector("#modelInput"),
   apiKeyInput: document.querySelector("#apiKeyInput"),
   autoConfirmInput: document.querySelector("#autoConfirmInput"),
+  directWorkspaceInput: document.querySelector("#directWorkspaceInput"),
   saveSettingsBtn: document.querySelector("#saveSettingsBtn"),
   saveStatus: document.querySelector("#saveStatus"),
   composer: document.querySelector("#composer"),
@@ -201,6 +204,7 @@ function renderSettings() {
   elements.modelInput.value = state.settings?.model || "";
   elements.apiKeyInput.value = state.settings?.apiKey || "";
   elements.autoConfirmInput.checked = Boolean(state.settings?.autoConfirmHumanGate);
+  elements.directWorkspaceInput.checked = state.settings?.directWorkspaceMode !== false;
 }
 
 function renderWorkspace() {
@@ -514,6 +518,7 @@ function renderControls() {
   elements.modelInput.disabled = disabled;
   elements.apiKeyInput.disabled = disabled;
   elements.autoConfirmInput.disabled = disabled;
+  elements.directWorkspaceInput.disabled = disabled;
   elements.messageInput.disabled = disabled;
   elements.sendBtn.disabled = disabled;
   elements.refreshObservabilityBtn.disabled = disabled;
@@ -625,7 +630,8 @@ async function saveSettings() {
     serverUrl: elements.serverInput.value,
     model: elements.modelInput.value,
     apiKey: elements.apiKeyInput.value,
-    autoConfirmHumanGate: elements.autoConfirmInput.checked
+    autoConfirmHumanGate: elements.autoConfirmInput.checked,
+    directWorkspaceMode: elements.directWorkspaceInput.checked
   });
   renderSettings();
   setStatus("Đã lưu");

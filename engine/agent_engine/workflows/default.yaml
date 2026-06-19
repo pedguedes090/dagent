@@ -4,6 +4,7 @@ name: dagent-secure-deterministic-v1
 limits:
   maxReworkAttempts: 2
   approvalGrantAttempts: 1
+  maxAutoApprovalCycles: 1
 
 nodes:
   - preflight
@@ -102,6 +103,9 @@ routes:
     default: execution_gate
 
   execution_gate:
+    cases:
+      - when: auto_rework_granted
+        target: openhands_worker
     default: reporter_end
 
 contextRoutes:

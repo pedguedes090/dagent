@@ -452,7 +452,7 @@ def _run_deterministic_scaffold_fallback(
     if violations:
         summary = "Deterministic local scaffold changes were filtered by allowedFiles policy."
         error = "Deterministic scaffold attempted to change files outside allowedFiles or inside forbiddenPaths."
-    elif should_scaffold_todo_fallback(worker_task_spec) and not applied:
+    elif fallback_result.get("used") and not applied:
         summary = "Deterministic local scaffold produced no file changes."
         error = "Scaffold fallback completed without creating project files."
     return _worker_result(
@@ -487,16 +487,6 @@ def run_openhands_worker(
     container_available = _container_available(worker_task_spec)
     emit("coder_agent", "Starting OpenHands coding agent" if container_available else "Starting policy-limited coding worker without Docker/Podman")
     events: list[str] = []
-
-    if not container_available and should_scaffold_todo_fallback(worker_task_spec):
-        return _run_deterministic_scaffold_fallback(
-            workspace=workspace,
-            worker_task_spec=worker_task_spec,
-            emit=emit,
-            dependency_workspace=dependency_workspace,
-            worktree_isolated=worktree_isolated,
-            reason="Docker/Podman unavailable; using deterministic local Todo scaffold fallback",
-        )
 
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
@@ -611,6 +601,8 @@ def run_openhands_worker(
         task = (
             "You are the Coder Agent in a multi-agent LangGraph pipeline.\n"
             "Follow this worker task spec exactly. Do not edit files outside allowedFiles. "
+            "For project creation, create files beneath targetProjectDir and keep all nested paths there. "
+            "The policy_file_editor automatically creates missing parent directories for create operations. "
             "Do not create tests unless the spec explicitly asks for tests. "
             "You receive only an explicit context envelope. Do not assume access to any prior conversation "
             "or agent output that is absent from it. "
@@ -776,7 +768,7 @@ def run_openhands_worker(
         error = "Coder attempted to change files outside allowedFiles or inside forbiddenPaths."
     elif fallback_result and fallback_result.get("used"):
         summary = "Coder agent used deterministic todo scaffold fallback after OpenHands produced no file changes."
-    elif should_scaffold_todo_fallback(worker_task_spec) and not applied:
+    elif fallback_result and fallback_result.get("used") and not applied:
         summary = "Coder agent produced no file changes."
         error = "Coder completed without creating project files."
     return _worker_result(

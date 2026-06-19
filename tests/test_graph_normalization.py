@@ -49,6 +49,28 @@ class GraphNormalizationTests(unittest.TestCase):
         self.assertEqual(spec["targetProjectDir"], "todo-app")
         self.assertEqual(spec["verificationCommands"], ["npm run build"])
 
+    def test_vocabulary_project_replaces_generic_app_target(self) -> None:
+        state = {
+            "task": "tạo trang web học từ vựng tiếng Anh bằng React",
+            "problem": {"problemStatement": "Create a vocabulary web app"},
+        }
+        final = {
+            "workerTaskSpec": {
+                "targetProjectDir": "app",
+                "projectRoot": "app",
+                "allowedFiles": ["src/**/*", "package.json"],
+            }
+        }
+
+        normalized = _normalize_worker_task_spec(final, state)
+        spec = normalized["workerTaskSpec"]
+
+        self.assertEqual(spec["targetProjectDir"], "vocabulary-app")
+        self.assertEqual(spec["projectRoot"], "vocabulary-app")
+        self.assertEqual(spec["verificationCwd"], "vocabulary-app")
+        self.assertIn("vocabulary-app/**", spec["allowedFiles"])
+        self.assertTrue(any("targetProjectDir 'vocabulary-app'" in item for item in spec["constraints"]))
+
     def test_todo_project_overrides_root_cwd_and_allows_target_dir(self) -> None:
         state = {
             "task": "tạo todo app với css hiện đại phù hợp với điện thoại máy tính tablet",

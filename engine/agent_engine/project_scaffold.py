@@ -23,10 +23,32 @@ def _package_name(target: str) -> str:
     return name or "todo-app"
 
 
+def _scaffold_intent_text(spec: dict[str, Any]) -> str:
+    authoritative_fields = {
+        "objective": spec.get("objective"),
+        "targetProjectDir": spec.get("targetProjectDir"),
+        "projectRoot": spec.get("projectRoot"),
+        "acceptanceCriteria": spec.get("acceptanceCriteria"),
+    }
+    return json.dumps(authoritative_fields, ensure_ascii=False, default=str).lower()
+
+
 def should_scaffold_todo_fallback(spec: dict[str, Any]) -> bool:
     stack = str(spec.get("projectStack") or "").lower()
-    text = json.dumps(spec, ensure_ascii=False, default=str).lower()
-    return stack in {"node", "web", "generic", ""} and "todo" in text and any(word in text for word in ["app", "web", "ứng dụng", "responsive"])
+    text = _scaffold_intent_text(spec)
+    vocabulary_signals = (
+        "vocabulary",
+        "từ vựng",
+        "tu vung",
+        "học tiếng anh",
+        "hoc tieng anh",
+        "english word",
+        "flashcard",
+    )
+    todo_signals = ("todo", "to-do", "task list", "danh sách việc", "danh sach viec")
+    requests_vocabulary = any(signal in text for signal in vocabulary_signals)
+    requests_todo = any(signal in text for signal in todo_signals)
+    return stack in {"node", "web", "generic", ""} and requests_todo and not requests_vocabulary
 
 
 def scaffold_todo_app(workspace: str, spec: dict[str, Any]) -> dict[str, Any]:

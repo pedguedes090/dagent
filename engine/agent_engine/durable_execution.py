@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .debug_log import write_debug_event
+from .state_store import configure_connection
 
 _execution_id: ContextVar[str] = ContextVar("durable_execution_id", default="")
 _database_path: ContextVar[str] = ContextVar("durable_database_path", default="")
@@ -95,9 +96,7 @@ class DurableExecutionStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode = WAL")
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA busy_timeout = 30000")
+        configure_connection(self.conn)
         self._lock = threading.RLock()
         self._migrate()
 

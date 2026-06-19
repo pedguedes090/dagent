@@ -4,8 +4,16 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from agent_engine.workspace import create_workspace_sandbox, enforce_change_policy, file_snapshots, normalize_verification_commands, run_command
+from agent_engine.workspace import (
+    create_workspace_sandbox,
+    enforce_change_policy,
+    file_snapshots,
+    normalize_verification_commands,
+    run_command,
+    run_setup_commands,
+)
 
 
 class WorkspacePolicyTests(unittest.TestCase):
@@ -91,6 +99,48 @@ class WorkspacePolicyTests(unittest.TestCase):
             )
 
         self.assertEqual(commands, [{"cwd": "todo-app", "command": "npm run build"}])
+
+    def test_normalize_verification_commands_skips_missing_package_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "package.json").write_text(
+                '{"scripts":{"build":"node scripts/build.js"}}',
+                encoding="utf-8",
+            )
+            commands = normalize_verification_commands(
+                str(root),
+                ["npm test", "npm run build"],
+                spec={},
+            )
+
+        self.assertEqual(commands, [{"cwd": ".", "command": "npm run build"}])
+
+    def test_setup_commands_run_install_inside_opened_target_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = root / "vocabulary-app"
+            project.mkdir()
+            (project / "package.json").write_text('{"name":"vocabulary-app"}', encoding="utf-8")
+            completed = mock.Mock(returncode=0, stdout="installed", stderr="")
+            with mock.patch("agent_engine.workspace.subprocess.run", return_value=completed) as run:
+                results = run_setup_commands(
+                    str(root),
+                    ["cd vocabulary-app", "npm install"],
+                    target_project_dir="vocabulary-app",
+                )
+
+        self.assertEqual(results[-1]["code"], 0)
+        self.assertTrue(results[-1]["directWorkspace"])
+        self.assertEqual(Path(run.call_args.kwargs["cwd"]), project)
+
+    def test_setup_commands_reject_shell_metacharacters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch("agent_engine.workspace.subprocess.run") as run:
+                results = run_setup_commands(temp_dir, ["npm install && echo unsafe"])
+
+        run.assert_not_called()
+        self.assertTrue(results[0]["skipped"])
+        self.assertIn("allowlist", results[0]["reason"])
 
     def test_workspace_sandbox_cleans_up_after_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

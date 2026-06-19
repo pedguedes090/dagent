@@ -138,6 +138,98 @@ class DurableExecutionTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
+    def test_read_only_pipeline_skips_git_worktree(self) -> None:
+        class FakeGraph:
+            def get_state(self, _config):
+                return SimpleNamespace(next=(), values={})
+
+            def invoke(self, input_value, config=None, durability=None):
+                self.input_value = input_value
+                return {
+                    "task": input_value["task"],
+                    "taskIntent": input_value["taskIntent"],
+                    "result": {"assistantText": "summary", "changedFiles": [], "review": {"passed": True}},
+                }
+
+        @contextmanager
+        def fake_checkpointer(_emit):
+            yield object()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+            os.environ["AGENT_ENGINE_STATE_DIR"] = temp_dir
+            payload = {
+                "executionId": "exec-read-only",
+                "correlationId": "cid-read-only",
+                "sessionId": "session-1",
+                "content": "đọc README.md và tóm tắt, không sửa file",
+                "workspacePath": temp_dir,
+                "settings": {"serverUrl": "http://model.test/v1", "model": "test", "apiKey": ""},
+                "messages": [],
+            }
+            try:
+                with (
+                    mock.patch("agent_engine.graph._open_checkpointer", fake_checkpointer),
+                    mock.patch("agent_engine.graph.build_graph", return_value=FakeGraph()),
+                    mock.patch("agent_engine.graph.prepare_execution_worktree") as prepare_worktree,
+                ):
+                    result = run_pipeline(payload, lambda _stage, _detail: None)
+
+                prepare_worktree.assert_not_called()
+                self.assertEqual(result["executionId"], "exec-read-only")
+                self.assertEqual(result["changedFiles"], [])
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
+    def test_write_pipeline_uses_opened_workspace_directly_by_default(self) -> None:
+        class FakeGraph:
+            def get_state(self, _config):
+                return SimpleNamespace(next=(), values={})
+
+            def invoke(self, input_value, config=None, durability=None):
+                self.input_value = input_value
+                return {
+                    "task": input_value["task"],
+                    "result": {"assistantText": "done", "changedFiles": [], "review": {"passed": True}},
+                }
+
+        @contextmanager
+        def fake_checkpointer(_emit):
+            yield object()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+            os.environ["AGENT_ENGINE_STATE_DIR"] = temp_dir
+            fake_graph = FakeGraph()
+            payload = {
+                "executionId": "exec-direct-workspace",
+                "correlationId": "cid-direct-workspace",
+                "sessionId": "session-1",
+                "content": "tạo app React",
+                "workspacePath": temp_dir,
+                "settings": {"serverUrl": "http://model.test/v1", "model": "test", "apiKey": ""},
+                "messages": [],
+            }
+            try:
+                with (
+                    mock.patch("agent_engine.graph._open_checkpointer", fake_checkpointer),
+                    mock.patch("agent_engine.graph.build_graph", return_value=fake_graph),
+                    mock.patch("agent_engine.graph.prepare_execution_worktree") as prepare_worktree,
+                ):
+                    run_pipeline(payload, lambda _stage, _detail: None)
+
+                prepare_worktree.assert_not_called()
+                self.assertEqual(fake_graph.input_value["workspacePath"], str(Path(temp_dir).resolve()))
+                self.assertEqual(fake_graph.input_value["worktreeInfo"]["mode"], "direct-workspace")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
     def test_sanitize_payload_redacts_nested_credentials(self) -> None:
         value = sanitize_payload({"authorization": "Bearer x", "nested": {"access_token": "x", "safe": "ok"}})
         self.assertEqual(value["authorization"], "[redacted]")

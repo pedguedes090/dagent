@@ -16,9 +16,11 @@ from .autonomy import autonomy_status, run_idle_discovery
 from .broker import SQLiteAgentBroker
 from .debug_log import write_debug_event
 from .durable_execution import DurableExecutionStore
-from .graph import run_pipeline
+from .graph import classify_execution, run_pipeline
+from .state_store import control_plane_path, migrate_legacy_tables
 
-_RUN_LOCK = threading.Lock()
+_WRITE_LOCK = threading.Lock()
+_AUTONOMY_LOCK = threading.Lock()
 
 
 def _state_dir_path() -> Path:
@@ -96,14 +98,17 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "stateDir": str(state_dir),
                     "debugLogDir": str(state_dir / "logs"),
-                    "runLockActive": _RUN_LOCK.locked(),
+                    "runLockActive": _WRITE_LOCK.locked(),
+                    "writeLockActive": _WRITE_LOCK.locked(),
                     "recentEvents": _recent_debug_events(),
                 },
             )
             return
         if self.path == "/v1/autonomy/status":
             payload = autonomy_status(_state_dir_path())
-            payload["runLockActive"] = _RUN_LOCK.locked()
+            payload["runLockActive"] = _WRITE_LOCK.locked()
+            payload["writeLockActive"] = _WRITE_LOCK.locked()
+            payload["autonomyScanActive"] = _AUTONOMY_LOCK.locked()
             self._send_json(200, payload)
             return
         self._send_json(404, {"error": "not_found"})
@@ -125,6 +130,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         headers = {key.lower(): value for key, value in self.headers.items()}
         correlation_id = telemetry.set_correlation_id(headers.get("x-correlation-id") or payload.get("correlationId"))
         payload["correlationId"] = correlation_id
+        admission = classify_execution(str(payload.get("content") or payload.get("task") or ""))
+        execution_class = str(admission["executionClass"])
+        payload["executionClass"] = execution_class
         write_debug_event(
             "http.run_received",
             {
@@ -163,13 +171,17 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         ) as span:
             lock_acquired = False
             try:
-                if not _RUN_LOCK.acquire(blocking=False):
-                    write_debug_event("run.queued", {"correlationId": correlation_id})
-                    emit("queued", "Another run is active; waiting for the global run lock")
-                    _RUN_LOCK.acquire()
-                lock_acquired = True
-                write_debug_event("run.running", {"correlationId": correlation_id})
-                emit("running", "Global run lock acquired")
+                if execution_class == "write":
+                    if not _WRITE_LOCK.acquire(blocking=False):
+                        write_debug_event("run.queued", {"correlationId": correlation_id, "executionClass": execution_class})
+                        emit("queued", "Another write-capable run is active; waiting for the write lock")
+                        _WRITE_LOCK.acquire()
+                    lock_acquired = True
+                    write_debug_event("run.running", {"correlationId": correlation_id, "executionClass": execution_class})
+                    emit("running", "Write lane admitted")
+                else:
+                    write_debug_event("run.running", {"correlationId": correlation_id, "executionClass": execution_class})
+                    emit("running", "Read-only lane admitted without the write lock")
                 result = run_pipeline(payload, emit)
                 if span:
                     span.set_attribute("run.id", result.get("id", ""))
@@ -190,7 +202,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 write_line({"type": "error", "error": str(exc)})
             finally:
                 if lock_acquired:
-                    _RUN_LOCK.release()
+                    _WRITE_LOCK.release()
                     write_debug_event("run.released", {"correlationId": correlation_id})
 
     def _handle_autonomy_idle_scan(self) -> None:
@@ -211,9 +223,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         headers = {key.lower(): value for key, value in self.headers.items()}
         correlation_id = telemetry.set_correlation_id(headers.get("x-correlation-id") or payload.get("correlationId"))
-        if not _RUN_LOCK.acquire(blocking=False):
-            write_debug_event("autonomy.idle_scan_skipped", {"reason": "run_lock_active", "correlationId": correlation_id})
-            self._send_json(409, {"ok": False, "error": "run_lock_active", "runLockActive": True})
+        if not _AUTONOMY_LOCK.acquire(blocking=False):
+            write_debug_event("autonomy.idle_scan_skipped", {"reason": "autonomy_scan_active", "correlationId": correlation_id})
+            self._send_json(
+                409,
+                {
+                    "ok": False,
+                    "error": "autonomy_scan_active",
+                    "runLockActive": _WRITE_LOCK.locked(),
+                    "writeLockActive": _WRITE_LOCK.locked(),
+                    "autonomyScanActive": True,
+                },
+            )
             return
 
         try:
@@ -227,7 +248,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "correlationId": correlation_id,
-                    "runLockActive": False,
+                    "runLockActive": _WRITE_LOCK.locked(),
+                    "writeLockActive": _WRITE_LOCK.locked(),
+                    "autonomyScanActive": False,
                     "report": report,
                     "memory": report.get("memory"),
                 },
@@ -236,7 +259,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             write_debug_event("autonomy.idle_scan_error", {"error": str(exc), "correlationId": correlation_id})
             self._send_json(500, {"ok": False, "error": str(exc)})
         finally:
-            _RUN_LOCK.release()
+            _AUTONOMY_LOCK.release()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -253,10 +276,21 @@ def main(argv: list[str] | None = None) -> int:
     server = ThreadingHTTPServer((args.host, args.port), AgentRequestHandler)
     try:
         state_dir = _state_dir_path()
-        supervisor = DurableExecutionStore(state_dir / "durable-executions.sqlite")
+        db_path = control_plane_path(state_dir)
+        supervisor = DurableExecutionStore(db_path)
+        migrate_legacy_tables(
+            db_path,
+            state_dir / "durable-executions.sqlite",
+            ("durable_executions", "durable_steps"),
+        )
         durable_recovered = supervisor.recover_incomplete()
         supervisor.close()
-        broker = SQLiteAgentBroker(state_dir / "agent-broker.sqlite")
+        broker = SQLiteAgentBroker(db_path)
+        migrate_legacy_tables(
+            db_path,
+            state_dir / "agent-broker.sqlite",
+            ("agent_runs", "agent_subtasks", "agent_events"),
+        )
         recovered = broker.recover_incomplete_runs()
         broker.close()
         telemetry.record_crash_recoveries(recovered + durable_recovered)

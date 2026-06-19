@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from agent_engine.openhands_worker import _load_mcp_config, run_openhands_worker
+from agent_engine.project_scaffold import should_scaffold_todo_fallback
 
 
 class FakeLLM:
@@ -95,7 +96,8 @@ def assert_worker_contract(testcase: unittest.TestCase, result: dict) -> None:
 
 
 class OpenHandsWorkerCleanupTests(unittest.TestCase):
-    def test_worker_uses_deterministic_scaffold_when_container_is_unavailable(self) -> None:
+    def test_worker_tries_model_before_todo_scaffold_without_container(self) -> None:
+        FakeConversation.instances = []
         with tempfile.TemporaryDirectory() as workspace:
             spec = {
                 "objective": "Create a responsive Todo App",
@@ -107,7 +109,14 @@ class OpenHandsWorkerCleanupTests(unittest.TestCase):
                 "forbiddenPaths": [".env", ".git/**"],
                 "verificationCommands": ["npm run build"],
             }
-            with mock.patch("agent_engine.openhands_worker.container_status", return_value={"ready": False, "reason": "no runtime"}):
+            with (
+                mock.patch("agent_engine.openhands_worker.container_status", return_value={"ready": False, "reason": "no runtime"}),
+                mock.patch("openhands.sdk.LLM", FakeLLM),
+                mock.patch("openhands.sdk.Agent", FakeAgent),
+                mock.patch("openhands.sdk.Tool", lambda name, **_kwargs: name),
+                mock.patch("openhands.sdk.Conversation", FakeNoopConversation),
+                mock.patch("openhands.sdk.context.condenser.LLMSummarizingCondenser", FakeCondenser),
+            ):
                 result = run_openhands_worker(
                     workspace=workspace,
                     server_url="http://model.test/v1",
@@ -122,9 +131,27 @@ class OpenHandsWorkerCleanupTests(unittest.TestCase):
 
             self.assertIsNone(result["error"])
             self.assertEqual(result["scaffoldFallback"]["kind"], "todo_app")
-            self.assertFalse(result["sandboxed"])
+            self.assertTrue(result["sandboxed"])
+            self.assertTrue(FakeConversation.instances)
             self.assertTrue((Path(workspace) / "todo-app" / "package.json").exists())
             self.assertTrue(any(item["path"] == "todo-app/package.json" for item in result["changedFiles"]))
+
+    def test_vocabulary_goal_never_selects_todo_scaffold_from_context_noise(self) -> None:
+        spec = {
+            "objective": "Chuyển ứng dụng todo cũ sang ứng dụng học từ vựng tiếng Anh",
+            "projectStack": "node",
+            "targetProjectDir": "vocabulary-app",
+            "acceptanceCriteria": ["Người dùng thêm và ôn từ mới"],
+            "contextEnvelope": {
+                "inputs": {
+                    "workerContext": {
+                        "history": "todo todo todo",
+                    }
+                }
+            },
+        }
+
+        self.assertFalse(should_scaffold_todo_fallback(spec))
 
     def test_mcp_config_loads_only_trusted_sanitized_servers(self) -> None:
         emitted: list[tuple[str, str]] = []

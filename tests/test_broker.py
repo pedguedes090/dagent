@@ -27,6 +27,7 @@ class BrokerTests(unittest.TestCase):
                     execution_id="exec-test",
                 )
                 self.assertEqual(resumed_run_id, run_id)
+                self.assertEqual(run_id, "exec-test")
                 broker.dispatch_subtasks(run_id, [{"role": "planner", "title": "Plan", "input": {}}])
                 broker.dispatch_subtasks(run_id, [{"role": "planner", "title": "Plan", "input": {}}])
                 count = broker.conn.execute("SELECT COUNT(*) AS count FROM agent_subtasks WHERE run_id = ?", (run_id,)).fetchone()

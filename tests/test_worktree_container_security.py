@@ -7,7 +7,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_engine.container_sandbox import _container_command, container_status, run_container_command
+from openhands.tools.file_editor.definition import FileEditorAction
+
+from agent_engine.container_sandbox import (
+    PolicyFileEditorExecutor,
+    _container_command,
+    container_status,
+    run_container_command,
+)
 from agent_engine.worktree_manager import (
     cleanup_execution_worktree,
     merge_execution_worktree,
@@ -22,6 +29,153 @@ def git(cwd: Path, *args: str) -> None:
 
 
 class WorktreeContainerSecurityTests(unittest.TestCase):
+    def test_policy_file_editor_create_makes_allowed_parent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir:
+            workspace = Path(workspace_dir)
+            executor = PolicyFileEditorExecutor(
+                str(workspace),
+                allowed_files=["vocabulary-app/**"],
+                forbidden_paths=["**/.env"],
+            )
+
+            executor(
+                FileEditorAction(
+                    command="create",
+                    path="vocabulary-app/src/hooks/useLocalStorage.js",
+                    file_text="export const storageKey = 'vocabulary';\n",
+                )
+            )
+
+            created = workspace / "vocabulary-app" / "src" / "hooks" / "useLocalStorage.js"
+            self.assertEqual(created.read_text(encoding="utf-8"), "export const storageKey = 'vocabulary';\n")
+
+    def test_policy_file_editor_does_not_create_disallowed_parent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir:
+            workspace = Path(workspace_dir)
+            executor = PolicyFileEditorExecutor(
+                str(workspace),
+                allowed_files=["vocabulary-app/**"],
+                forbidden_paths=[],
+            )
+
+            executor(
+                FileEditorAction(
+                    command="create",
+                    path="outside/src/app.js",
+                    file_text="blocked\n",
+                )
+            )
+
+            self.assertFalse((workspace / "outside").exists())
+
+    def test_empty_workspace_bootstraps_git_before_creating_worktree(self) -> None:
+        old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as state_dir:
+            workspace = Path(workspace_dir)
+            os.environ["AGENT_ENGINE_STATE_DIR"] = state_dir
+            try:
+                info = prepare_execution_worktree(str(workspace), "exec-empty-workspace")
+
+                self.assertTrue(info["ready"])
+                self.assertTrue(info["bootstrappedRepo"])
+                self.assertTrue((workspace / ".git").is_dir())
+                commit_count = subprocess.run(
+                    ["git", "rev-list", "--count", "HEAD"],
+                    cwd=workspace,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertEqual(commit_count, "1")
+
+                worktree = Path(info["workspacePath"])
+                (worktree / "app.txt").write_text("created by agent\n", encoding="utf-8")
+                merged = merge_execution_worktree(info)
+
+                self.assertEqual(merged["conflicts"], [])
+                self.assertEqual(merged["policyViolations"], [])
+                self.assertEqual((workspace / "app.txt").read_text(encoding="utf-8"), "created by agent\n")
+                self.assertTrue(cleanup_execution_worktree(info)["removed"])
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
+    def test_non_empty_workspace_without_git_remains_blocked(self) -> None:
+        old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as state_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "existing.txt").write_text("keep me\n", encoding="utf-8")
+            os.environ["AGENT_ENGINE_STATE_DIR"] = state_dir
+            try:
+                info = prepare_execution_worktree(str(workspace), "exec-non-git-workspace")
+
+                self.assertFalse(info["ready"])
+                self.assertIn("contains files", info["reason"])
+                self.assertFalse((workspace / ".git").exists())
+                self.assertEqual((workspace / "existing.txt").read_text(encoding="utf-8"), "keep me\n")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
+    def test_repository_without_commits_gets_initial_head_before_worktree(self) -> None:
+        old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as state_dir:
+            workspace = Path(workspace_dir)
+            git(workspace, "init")
+            (workspace / "existing.txt").write_text("uncommitted baseline\n", encoding="utf-8")
+            git(workspace, "add", "existing.txt")
+            os.environ["AGENT_ENGINE_STATE_DIR"] = state_dir
+            try:
+                missing_head = subprocess.run(
+                    ["git", "rev-parse", "--verify", "HEAD"],
+                    cwd=workspace,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(missing_head.returncode, 0)
+
+                info = prepare_execution_worktree(str(workspace), "exec-unborn-head")
+
+                self.assertTrue(info["ready"], info.get("reason"))
+                self.assertTrue(info["initializedHead"])
+                self.assertEqual(
+                    (Path(info["workspacePath"]) / "existing.txt").read_text(encoding="utf-8"),
+                    "uncommitted baseline\n",
+                )
+                head = subprocess.run(
+                    ["git", "rev-parse", "--verify", "HEAD"],
+                    cwd=workspace,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertTrue(head)
+                status = subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=workspace,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                self.assertIn("A  existing.txt", status)
+                committed_file = subprocess.run(
+                    ["git", "cat-file", "-e", "HEAD:existing.txt"],
+                    cwd=workspace,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(committed_file.returncode, 0)
+                self.assertTrue(cleanup_execution_worktree(info)["removed"])
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
     def test_worktree_preserves_dirty_baseline_and_merges_only_reviewed_delta(self) -> None:
         old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as state_dir:

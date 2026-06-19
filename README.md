@@ -95,22 +95,30 @@ User Task
 - LLM vẫn phân tích/lập kế hoạch/review ngữ nghĩa nhưng không được chọn node tiếp theo, tăng retry budget hoặc đổi điều kiện rẽ nhánh.
 - Mỗi node nhận một context envelope theo allowlist `contextRoutes`; history, settings, secret và output không thuộc cạnh hiện tại không được đưa vào prompt.
 - Planner Agent tạo task graph; Orchestrator dispatch subtask qua SQLite broker cục bộ.
-- Mỗi execution ghi file được cấp một git worktree riêng. Workspace nguồn chỉ nhận thay đổi sau khi Tester, Security Reviewer và Code Reviewer đều đạt.
-- Coder chỉ được merge thay đổi trong `allowedFiles`; thay đổi ngoài policy bị rollback trong worktree và báo blocker.
+- Mặc định app dùng direct workspace mode: Coder, setup/install và verification thao tác ngay trong thư mục đang mở; `node_modules`, build output và file thay đổi không phải copy/merge qua AppData.
+- Với project Node, dependency được đồng bộ lại sau mỗi lượt Coder theo lockfile (`pnpm`, `yarn`, `bun` hoặc `npm`) trước khi verification chạy.
+- Có thể tắt **Làm trực tiếp** để quay lại git worktree-per-execution. Ở chế độ cô lập này workspace nguồn chỉ nhận thay đổi sau khi review đạt.
+- Coder chỉ được ghi trong `allowedFiles`; `forbiddenPaths` và kiểm tra path escape vẫn áp dụng ở cả direct mode lẫn worktree mode.
 - Worker result luôn mang debug contract: `sandboxDiff`, `policyViolations`, `appliedChanges`, `selectedExecutionRoot`, `events`, `error`.
 - Docker/Podman là lớp sandbox ưu tiên, không phải điều kiện bắt buộc. Nếu có container, shell command chạy với network `none`, root filesystem read-only, drop toàn bộ Linux capabilities, `no-new-privileges`, giới hạn PID/RAM/CPU và chỉ mount worktree làm vùng ghi.
-- Nếu thiếu Docker/Podman, Coder vẫn chạy trong git worktree với `PolicyFileEditorTool`; shell tool bị tắt, còn Tester chỉ chạy verification command allowlist trên bản sao tạm của worktree.
-- Tester chạy trên một bản sao tạm của worktree rồi hủy bản sao đó, nên script build/test không thể làm bẩn nội dung đang chờ merge.
+- Nếu thiếu Docker/Podman, direct mode chạy setup/install allowlist và verification ngay trong workspace; Coder dùng `PolicyFileEditorTool` giới hạn đường dẫn.
+- `PolicyFileEditorTool` tự tạo thư mục cha khi tạo file mới, nên các đường dẫn như `src/hooks/useLocalStorage.js` không còn lỗi `Errno 2`; containment, `allowedFiles` và `forbiddenPaths` vẫn được kiểm tra trước khi tạo thư mục.
+- Thiếu Docker/Podman không làm Coder nhảy thẳng vào template: model vẫn được chạy với file editor giới hạn quyền. Todo scaffold chỉ là fallback cuối và chỉ kích hoạt khi objective cuối cùng thật sự yêu cầu Todo, không quét context/history để đoán loại sản phẩm.
+- Trong worktree mode, Tester vẫn dùng bản sao tạm; trong direct mode, Tester chạy ngay tại project để dùng đúng dependency đã cài.
+- Verification chỉ chạy npm script thực sự có trong `package.json`; ví dụ project chỉ có `build` sẽ không bị chặn vì planner đề xuất thêm `npm test`.
+- Thiếu Docker/Podman mặc định là warning khi host allowlist fallback chạy trong bản sao cô lập; chỉ trở thành blocker khi `AGENT_REQUIRE_CONTAINER=1`.
 - Worktree loại credential phổ biến và symlink trước khi chạy agent; merge cuối cùng kiểm tra lại `allowedFiles`, `forbiddenPaths`, symlink và xung đột nguồn theo cơ chế all-or-nothing.
 - Security Reviewer, Code Reviewer và Release/Deploy Agent là các role độc lập quyết định risk, merge readiness và rollback/deploy notes.
 - Nếu task bị đánh dấu `high` risk, pipeline dừng ở human gate cho tới khi người dùng xác nhận.
 - Sau đúng `maxReworkAttempts` trong workflow YAML, pipeline dừng ở execution gate. Xác nhận chỉ cấp đúng `approvalGrantAttempts` lượt bổ sung; bộ đếm không bị reset và không có vòng lặp vô hạn.
+- Khi bật auto-confirm, Execution Gate tự cấp tối đa `maxAutoApprovalCycles` chu kỳ bổ sung rồi kết thúc/rollback nếu lỗi thật vẫn còn; không tạo approval pending và không yêu cầu người dùng gửi “xác nhận”.
+- Lỗi thiếu tool/dependency trong verification sandbox như `jest`/`vitest` chưa có trong `node_modules` được ghi là verification unavailable warning, không đưa Coder vào vòng lặp sửa mã hoặc yêu cầu `npm install`.
 - Tester không chạy dev server như `npm start`; chỉ chạy các lệnh verification an toàn như `npm run check`, `npm test`, `npm run build`, `pytest`, `go test`.
 - Các yêu cầu chỉ đọc như “đọc”, “giải thích”, “tóm tắt”, “trả lời” sẽ không ghi file.
 
 ## Container Sandbox
 
-Task ghi file vẫn yêu cầu Git để tạo worktree-per-execution. Docker/Podman là tùy chọn: có thì dùng container sandbox mạnh; thiếu thì pipeline chuyển sang host fallback giới hạn, không cấp shell tự do cho Coder và chỉ chạy verification allowlist trên bản sao tạm. Nếu muốn bắt buộc container trong môi trường doanh nghiệp, đặt:
+Direct workspace mode được bật mặc định và không yêu cầu Git. Setup command được giới hạn ở các package manager phổ biến (`npm`, `pnpm`, `yarn`, `bun`, `pip`, `uv`), không chấp nhận shell metachar và không được thoát khỏi workspace. Khi tắt **Làm trực tiếp**, task ghi file quay lại yêu cầu Git để tạo worktree-per-execution. Docker/Podman vẫn là tùy chọn; nếu muốn bắt buộc container trong môi trường doanh nghiệp, đặt:
 
 ```powershell
 $env:AGENT_REQUIRE_CONTAINER = "1"
@@ -142,18 +150,21 @@ $env:AGENT_SANDBOX_IMAGE_NODE = "registry.internal/agent-node@sha256:..."
 
 ## State Authority
 
-Hệ thống dùng hai miền SQLite cục bộ có authority khác nhau để tránh drift sau crash:
+Execution control plane dùng chung `${AGENT_ENGINE_STATE_DIR}/agent-state.sqlite`; authority được tách theo bảng thay vì theo nhiều file dễ drift:
 
-- App DB `agent-state.sqlite` là nguồn sự thật cho UI/session: settings không chứa secret thô, danh sách phiên, messages, run summaries đã trả về UI và approval records người dùng thấy.
-- Engine DB `agent-broker.sqlite` là nguồn sự thật cho execution runtime: run/subtask status, broker events, crash recovery của worker roles.
-- LangGraph checkpoint DB `langgraph-checkpoints.sqlite` là nguồn sự thật cho checkpoint/resume nội bộ của graph.
-- Durable supervisor DB `durable-executions.sqlite` quản lý execution ID riêng cho từng task, lease/heartbeat, retry count, kết quả idempotent và checkpoint của từng tool call.
-- Mỗi execution dùng `executionId` làm LangGraph `thread_id`; approval tạo thread dẫn xuất từ cùng ID. Retry kỹ thuật gọi graph với input `None` để tiếp tục đúng node đang pending.
+- `durable_executions` là nguồn sự thật cho lifecycle, lease/heartbeat, retry count và terminal result.
+- `durable_steps` lưu node/tool attempt và kết quả idempotent.
+- `agent_runs`, `agent_subtasks`, `agent_events` là projection cho role runtime, broker events và recovery.
+- LangGraph `checkpoints`, `writes` là machine state phục vụ checkpoint/resume, không phán quyết lifecycle.
+- Các bảng Electron `sessions`, `messages`, `runs`, `approvals` là UI projection và approval records người dùng thấy.
+- `executionId` là identity canonical: broker run ID, UI run ID và LangGraph base `thread_id` dùng cùng giá trị; approval tạo checkpoint thread dẫn xuất từ ID đó.
+- Ba file engine cũ `agent-broker.sqlite`, `langgraph-checkpoints.sqlite`, `durable-executions.sqlite` được import một lần vào control-plane DB.
 - OpenHands lưu conversation và worktree metadata dưới `${AGENT_ENGINE_STATE_DIR}/executions/`; worktree được giữ lại qua lỗi mạng/human gate và chỉ merge sau review đạt.
 - Startup app gọi `SessionStore.reconcileStartupState()` để đánh dấu các UI run không-terminal còn sót là `recovered`.
 - Startup backend gọi `SQLiteAgentBroker.recover_incomplete_runs()` để chuyển execution run/subtask kẹt ở `running`, `queued`, `needs_rework` sang `recovered`.
 - Startup backend cũng chuyển execution có lease dở dang sang `recoverable`; Electron tự kết nối lại một lần với cùng `executionId`.
 - Không dùng App DB để phán quyết worker đã merge file hay chưa; xem `appliedChanges`, `policyViolations`, broker events và JSONL debug log của engine.
+- Quyết định giữ local-first và các trigger chuyển sang Temporal nằm trong `docs/architecture/0001-local-first-control-plane.md`.
 
 ## Secrets
 
@@ -165,7 +176,7 @@ Hệ thống dùng hai miền SQLite cục bộ có authority khác nhau để t
 
 - Giao diện chính là Web Dashboard: DAG board hiển thị trạng thái từng node, metric cards, kết quả gần nhất, changed files/blockers, live timeline và backend event log.
 - UI không còn render transcript chat cuộn dài; session messages vẫn được lưu nội bộ để engine có context và để xác nhận Human Gate/Execution Gate.
-- Backend giữ single-run lock toàn cục. Nếu có run khác đang chạy, request sau sẽ stream stage `queued`, rồi `running` khi lấy được lock.
+- Backend chỉ serialize write-capable run bằng write lock. Read-only run được admission trước pipeline, không tạo git worktree và có thể chạy song song với write lane; task mơ hồ fail-closed vào write lane.
 - Stage `task_intent` cho biết hệ thống đã nhận task thành `read-only`, `modify`, `create_project` hay `command` trước khi để LLM committee suy luận tiếp.
 - Stage `codegraph_context` cho biết pipeline có dùng được semantic code context từ CodeGraph hay không.
 - Event OpenHands được rút gọn thành các dòng dễ đọc như `terminal: npm run build`, `file_editor: edit src/App.jsx`, `task_tracker: ...`.
@@ -251,7 +262,7 @@ Giai đoạn 4 bổ sung control-plane tự trị bậc cao nhưng vẫn fail-sa
 - Nội dung trước khi lưu memory được redaction các secret/token/password/private key pattern phổ biến.
 - Pipeline preflight tự seed trusted root context vào ACT-R memory, retrieve các memory liên quan đến task và chuyển qua explicit context route `longTermMemory` cho Intake/Researcher như dữ liệu tham khảo, không phải instruction.
 - Endpoint `GET /v1/autonomy/status` trả memory stats và report gần nhất.
-- Endpoint `POST /v1/autonomy/idle-scan` chỉ chạy khi global run lock đang rảnh; nếu pipeline đang chạy sẽ trả `409 run_lock_active`.
+- Endpoint `POST /v1/autonomy/idle-scan` dùng lock riêng để chặn hai scan trùng nhau nhưng vẫn có thể chạy khi write lane đang bận.
 - Electron Dashboard có panel **Autonomy L4/L5** hiển thị finding ưu tiên cao, initiative dài hạn, skill proposal L5 và nút “Quét idle”. Dashboard cũng tự lên lịch một scan read-only ngắn khi workspace đang idle và chưa có report khớp workspace.
 
 Report gần nhất nằm ở `${AGENT_ENGINE_STATE_DIR}/autonomy/last-report.json` và có 3 phần chính:
@@ -390,6 +401,7 @@ Khuyến nghị thực tế:
 - `engine/agent_engine/autonomy.py`: idle technical-debt discovery, long-horizon planning và L5 skill proposal generation.
 - `engine/agent_engine/agent_contracts.py`: role contracts cho Planner, Researcher/Context, Coder, Tester, Security Reviewer, Code Reviewer và Release/Deploy Agent.
 - `engine/agent_engine/broker.py`: SQLite-backed local broker cho agent runs, subtasks và events.
+- `engine/agent_engine/state_store.py`: control-plane DB path, SQLite concurrency policy và one-time legacy migration.
 - `engine/agent_engine/multi_agent.py`: task graph, governance, review aggregation và release/deploy planning helpers.
 - `engine/agent_engine/openhands_worker.py`: worktree-isolated Coder adapter dùng `LLM`, `Agent`, `Conversation`, `ContainerTerminalTool`, `FileEditorTool`, `TaskTrackerTool`.
 - `engine/agent_engine/llm_client.py`: OpenAI-compatible client cho các committee read-only, có retry/backoff/circuit breaker nhẹ.

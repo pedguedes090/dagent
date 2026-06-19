@@ -405,6 +405,15 @@ class PolicyFileEditorExecutor(ToolExecutor[FileEditorAction, FileEditorObservat
                 command=action.command,
                 is_error=True,
             )
+        if action.command == "create":
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return FileEditorObservation.from_text(
+                    f"Could not create parent directories for {relative}: {exc}",
+                    command=action.command,
+                    is_error=True,
+                )
         return self.delegate(action.model_copy(update={"path": str(target)}), conversation)
 
 
@@ -433,7 +442,7 @@ class PolicyFileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservatio
                 description=(
                     "Read or edit files only inside the execution worktree. Reads matching forbiddenPaths "
                     "are denied, and writes must match allowedFiles. The /workspace prefix maps to the "
-                    "execution worktree."
+                    "execution worktree. Creating a file also creates its missing parent directories."
                 ),
                 annotations=ToolAnnotations(
                     title="policy_file_editor",

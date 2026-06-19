@@ -9,6 +9,7 @@ from typing import Any
 
 from . import telemetry
 from .debug_log import write_debug_event
+from .state_store import configure_connection
 
 
 def _now() -> str:
@@ -34,8 +35,7 @@ class SQLiteAgentBroker:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode = WAL")
-        self.conn.execute("PRAGMA foreign_keys = ON")
+        configure_connection(self.conn)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -109,10 +109,10 @@ class SQLiteAgentBroker:
         correlation_id: str | None = None,
         execution_id: str | None = None,
     ) -> str:
-        run_id = str(uuid.uuid4())
+        durable_id = str(execution_id or "")
+        run_id = durable_id or str(uuid.uuid4())
         now = _now()
         cid = telemetry.set_correlation_id(correlation_id)
-        durable_id = str(execution_id or "")
         if durable_id:
             existing = self.conn.execute("SELECT id FROM agent_runs WHERE execution_id = ?", (durable_id,)).fetchone()
             if existing:

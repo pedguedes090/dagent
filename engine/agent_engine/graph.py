@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import operator
+import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
@@ -40,6 +41,7 @@ from .multi_agent import (
     security_review_fallback,
 )
 from .openhands_worker import run_openhands_worker
+from .state_store import configure_connection, control_plane_path, migrate_legacy_tables
 from .workspace import (
     codegraph_affected_tests,
     codegraph_context,
@@ -48,6 +50,7 @@ from .workspace import (
     normalize_verification_commands,
     read_file,
     run_command,
+    run_setup_commands,
     trusted_context,
 )
 from .worktree_manager import cleanup_execution_worktree, merge_execution_worktree, prepare_execution_worktree
@@ -66,6 +69,7 @@ class PipelineState(TypedDict, total=False):
     messages: list[dict[str, Any]]
     sessionId: str
     executionId: str
+    executionClass: str
     correlationId: str
     preflight: dict[str, Any]
     taskIntent: dict[str, Any]
@@ -85,9 +89,12 @@ class PipelineState(TypedDict, total=False):
     governanceDecision: dict[str, Any]
     contextFiles: list[dict[str, Any]]
     workerContext: dict[str, Any]
+    setupCommandResults: list[dict[str, Any]]
+    setupCommandsCompleted: bool
     retryCount: int
     retryLimit: int
     reworkCycle: int
+    autoReworkGranted: bool
     workerAttempts: Annotated[list[dict[str, Any]], operator.add]
     testerResult: dict[str, Any]
     securityReview: dict[str, Any]
@@ -110,6 +117,148 @@ def _json(state: PipelineState, prompt: str, fallback: dict[str, Any]) -> dict[s
 
 def _context(state: PipelineState, node_name: str) -> dict[str, Any]:
     return DEFAULT_WORKFLOW.context_for(node_name, state)
+
+
+def _sanitize_review_claims(
+    review: dict[str, Any],
+    environment: dict[str, Any],
+    command_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    container_required = bool(environment.get("containerRequired"))
+    executed_commands = [
+        str(item.get("command") or "").strip().lower()
+        for item in command_results
+        if not item.get("skipped")
+    ]
+    has_test_command = any(
+        command in {"npm test", "pnpm test", "yarn test"}
+        or command.startswith(("npm run test", "pnpm run test", "yarn run test"))
+        for command in executed_commands
+    )
+    command_failed = any(
+        item.get("timedOut") or item.get("code") not in (0, None)
+        for item in command_results
+        if not item.get("skipped")
+    )
+    command_succeeded = any(
+        not item.get("skipped") and not item.get("timedOut") and item.get("code") == 0
+        for item in command_results
+    )
+    blockers: list[str] = []
+    warnings = [str(item) for item in review.get("warnings") or []]
+    for item in review.get("blockers") or []:
+        blocker = str(item)
+        lower = blocker.lower()
+        optional_container = (
+            not container_required
+            and any(token in lower for token in ("docker", "podman", "container"))
+            and any(
+                token in lower
+                for token in (
+                    "unavailable",
+                    "not available",
+                    "fallback",
+                    "không khả dụng",
+                    "không đạt chuẩn",
+                    "thiếu",
+                )
+            )
+        )
+        optional_test_script = (
+            not has_test_command
+            and (
+                "npm test" in lower
+                or "missing test script" in lower
+                or "no test script" in lower
+                or "thiếu cấu hình kiểm thử" in lower
+                or ("script" in lower and ("'test'" in lower or '"test"' in lower))
+            )
+        )
+        unsupported_failure = (
+            not command_failed
+            and (
+                "verification command failed" in lower
+                or ("lệnh" in lower and "thất bại" in lower)
+                or ("verification" in lower and "failed" in lower)
+            )
+        )
+        optional_dependency_failure = (
+            not command_failed
+            and any(
+                token in lower
+                for token in (
+                    "node_modules",
+                    "npm install",
+                    "dependency",
+                    "dependencies",
+                    "phụ thuộc",
+                    "jest",
+                    "vitest",
+                    "testing-library",
+                    "not recognized",
+                    "không được nhận diện",
+                    "không tìm thấy lệnh",
+                )
+            )
+        )
+        stale_filesystem_failure = (
+            command_succeeded
+            and (
+                "errno 2" in lower
+                or "no such file or directory" in lower
+                or (
+                    any(token in lower for token in ("không thể tạo", "ngăn cản việc tạo", "cannot create"))
+                    and any(token in lower for token in ("thư mục", "directory", "src/", "app/"))
+                )
+            )
+        )
+        if (
+            optional_container
+            or optional_test_script
+            or unsupported_failure
+            or optional_dependency_failure
+            or stale_filesystem_failure
+        ):
+            warnings.append(blocker)
+        else:
+            blockers.append(blocker)
+    return {
+        **review,
+        "blockers": list(dict.fromkeys(blockers)),
+        "warnings": list(dict.fromkeys(warnings)),
+    }
+
+
+def _normalize_verification_result(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("skipped") or result.get("timedOut") or result.get("code") in (0, None):
+        return result
+    command = str(result.get("command") or "").strip().lower()
+    if not command.startswith(("npm ", "pnpm ", "yarn ", "npx ")):
+        return result
+    output = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}".lower()
+    missing_dependency_signals = (
+        "is not recognized as an internal or external command",
+        "command not found",
+        "cannot find module",
+        "cannot find package",
+        "module_not_found",
+        "err_module_not_found",
+        "could not determine executable to run",
+        "node_modules",
+        "jest: not found",
+        "vitest: not found",
+        "'jest' is not recognized",
+        "'vitest' is not recognized",
+    )
+    if not any(signal in output for signal in missing_dependency_signals):
+        return result
+    return {
+        **result,
+        "originalCode": result.get("code"),
+        "skipped": True,
+        "verificationUnavailable": True,
+        "reason": "Verification dependency is not installed in the isolated workspace.",
+    }
 
 
 def _state_dir() -> Path:
@@ -177,21 +326,35 @@ def _long_term_memory_context(workspace_path: str, task: str, trusted_repo_conte
 
 @contextmanager
 def _open_checkpointer(emit: Callable[[str, str], None]):
-    db_path = _state_dir() / "langgraph-checkpoints.sqlite"
-    manager = SqliteSaver.from_conn_string(str(db_path))
-    if hasattr(manager, "__enter__"):
-        with manager as checkpointer:
-            emit("checkpoint", "SQLite checkpointer ready")
-            yield checkpointer
-    else:
+    state_dir = _state_dir()
+    db_path = control_plane_path(state_dir)
+    conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
+    configure_connection(conn)
+    checkpointer = SqliteSaver(conn)
+    try:
+        checkpointer.setup()
+        migrate_legacy_tables(
+            db_path,
+            state_dir / "langgraph-checkpoints.sqlite",
+            ("checkpoints", "writes"),
+        )
         emit("checkpoint", "SQLite checkpointer ready")
-        yield manager
+        yield checkpointer
+    finally:
+        conn.close()
 
 
 @contextmanager
 def _open_broker():
-    broker = SQLiteAgentBroker(_state_dir() / "agent-broker.sqlite")
+    state_dir = _state_dir()
+    db_path = control_plane_path(state_dir)
+    broker = SQLiteAgentBroker(db_path)
     try:
+        migrate_legacy_tables(
+            db_path,
+            state_dir / "agent-broker.sqlite",
+            ("agent_runs", "agent_subtasks", "agent_events"),
+        )
         yield broker
     finally:
         broker.close()
@@ -328,12 +491,29 @@ def _detect_task_intent(task: str, snapshot: dict[str, Any] | None = None) -> di
     }
 
 
+def classify_execution(task: str) -> dict[str, Any]:
+    intent = _detect_task_intent(task)
+    safe_read_only = bool(
+        intent.get("readOnly")
+        and intent.get("mode") in {"answer", "review"}
+        and not intent.get("needsClarification")
+        and not intent.get("signals", {}).get("change")
+        and not intent.get("signals", {}).get("conditionalEdit")
+    )
+    return {
+        "executionClass": "read_only" if safe_read_only else "write",
+        "taskIntent": intent,
+    }
+
+
 def _normalize_problem(problem: dict[str, Any], state: PipelineState) -> dict[str, Any]:
     intent = state.get("taskIntent") or _detect_task_intent(state["task"], state.get("preflight"))
     normalized = dict(problem or {})
     llm_task_type = str(normalized.get("taskType", "")).lower()
     llm_requires_worker = llm_task_type in {"modify", "edit", "create", "implement", "fix", "refactor", "build", "scaffold", "command"}
-    requires_worker = bool(intent.get("requiresWorker") or (llm_requires_worker and not intent.get("explicitNoEdit")))
+    requires_worker = False if state.get("executionClass") == "read_only" else bool(
+        intent.get("requiresWorker") or (llm_requires_worker and not intent.get("explicitNoEdit"))
+    )
     if requires_worker:
         normalized["taskType"] = "create" if intent.get("isProjectCreation") else ("command" if intent.get("mode") == "command" else "modify")
     elif intent.get("mode") in {"review", "answer"}:
@@ -410,6 +590,19 @@ def _default_project_dir(task: str, stack: str = "generic") -> str:
     value = task.lower()
     if "todo" in value or "to-do" in value:
         return "todo-app"
+    if any(
+        signal in value
+        for signal in (
+            "vocabulary",
+            "từ vựng",
+            "tu vung",
+            "học tiếng anh",
+            "hoc tieng anh",
+            "english word",
+            "flashcard",
+        )
+    ):
+        return "vocabulary-app"
     if stack == "python":
         return "python-app"
     if stack == "go":
@@ -445,6 +638,9 @@ def _project_creation_target(task: str, stack: str, spec: dict[str, Any]) -> str
     if explicit_target:
         target = _normalize_project_dir(explicit_target)
         if target:
+            inferred = _normalize_project_dir(_default_project_dir(task, stack)) or "."
+            if target in {"app", "web-app", "project"} and inferred not in {".", "app"}:
+                return inferred
             return target
     project_root = _normalize_project_dir(spec.get("projectRoot"))
     if project_root and project_root != ".":
@@ -496,6 +692,9 @@ def _normalize_worker_task_spec(final: dict[str, Any], state: PipelineState) -> 
         spec["verificationCommands"] = commands
         constraints = list(spec.get("constraints") or [])
         constraints.append("Scaffold/setup commands may be used by the OpenHands worker, but verification must run from targetProjectDir.")
+        constraints.append(
+            f"Create all project files under targetProjectDir '{target}'; do not place project src/package files at the workspace root."
+        )
         constraints.append("Do not use long-running dev server commands such as npm run dev, npm start, vite --host, air, flask run, uvicorn --reload, cargo watch, or go run as verification.")
         spec["constraints"] = list(dict.fromkeys(constraints))
         write_debug_event(
@@ -518,6 +717,13 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         emit("preflight", "Repo snapshot + trusted context")
         snapshot = get_snapshot(state["workspacePath"])
         task_intent = _detect_task_intent(state["task"], snapshot)
+        if state.get("executionClass") == "read_only":
+            task_intent = {
+                **task_intent,
+                "requiresWorker": False,
+                "readOnly": True,
+                "riskClass": "low",
+            }
         trusted = trusted_context(state["workspacePath"], snapshot)
         long_term_memory = _long_term_memory_context(state["workspacePath"], state["task"], trusted)
         mode = task_intent.get("mode")
@@ -796,8 +1002,14 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         }
 
     def environment_gate(state: PipelineState) -> dict[str, Any]:
-        emit("environment_gate", "Worktree ready; checking optional container isolation")
         worktree = state.get("worktreeInfo") or {}
+        direct_workspace = worktree.get("mode") == "direct-workspace"
+        emit(
+            "environment_gate",
+            "Direct workspace ready; checking optional container tools"
+            if direct_workspace
+            else "Worktree ready; checking optional container isolation",
+        )
         spec = (state.get("finalPlan") or {}).get("workerTaskSpec", {})
         stack = str(spec.get("projectStack") or "generic")
         required_stacks = {stack}
@@ -814,7 +1026,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             for item in containers.values()
             if isinstance(item, dict) and item.get("reason")
         ]
-        execution_mode = "container" if container_ready else "host_fallback"
+        execution_mode = "direct_workspace" if direct_workspace else ("container" if container_ready else "host_fallback")
         environment = {
             "ready": bool(worktree.get("ready")) and (container_ready or not require_container),
             "worktree": worktree,
@@ -824,10 +1036,13 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             "executionMode": execution_mode,
             "containerAvailable": container_ready,
             "containerRequired": require_container,
+            "directWorkspace": direct_workspace,
             "warnings": [] if container_ready else container_reasons,
         }
         if environment["ready"]:
-            if container_ready:
+            if direct_workspace:
+                emit("environment_gate", "Ready: editing, setup and verification will run in the opened workspace")
+            elif container_ready:
                 emit("environment_gate", f"Ready: {primary_container.get('runtime')} + isolated git worktree")
             else:
                 emit("environment_gate", "Ready without Docker/Podman: using git worktree + policy-limited host fallback")
@@ -906,7 +1121,21 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
     def openhands_worker(state: PipelineState) -> dict[str, Any]:
         spec = (state.get("workerContext") or {}).get("workerTaskSpec") or {}
         mode = (state.get("executionEnvironment") or {}).get("executionMode") or "container"
-        emit("coder_agent", "OpenHands coding worker with container sandbox" if mode == "container" else "OpenHands coding worker with policy-limited host fallback")
+        direct_workspace = bool((state.get("executionEnvironment") or {}).get("directWorkspace"))
+        if direct_workspace:
+            emit("coder_agent", "OpenHands coding worker operating directly in the opened workspace")
+        else:
+            emit("coder_agent", "OpenHands coding worker with container sandbox" if mode == "container" else "OpenHands coding worker with policy-limited host fallback")
+        setup_results = list(state.get("setupCommandResults") or [])
+        setup_completed = bool(state.get("setupCommandsCompleted"))
+        if direct_workspace and not setup_completed:
+            emit("setup_commands", "Running allowlisted setup/install commands in the opened workspace")
+            setup_results = run_setup_commands(
+                state["workspacePath"],
+                list(spec.get("commandsToRun") or []),
+                target_project_dir=str(spec.get("targetProjectDir") or spec.get("projectRoot") or "."),
+            )
+            setup_completed = True
         run_id = state.get("brokerRunId")
         subtask_id = None
         if run_id:
@@ -923,7 +1152,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             server_url=state["settings"]["serverUrl"],
             model=state["settings"]["model"],
             api_key=runtime_settings().get("apiKey", ""),
-            worker_task_spec={**spec, "contextEnvelope": _context(state, "openhands_worker")},
+            worker_task_spec={
+                **spec,
+                "setupCommandResults": setup_results,
+                "contextEnvelope": _context(state, "openhands_worker"),
+            },
             rework_context=state.get("latestReview"),
             emit=emit,
             execution_id=state.get("executionId"),
@@ -931,23 +1164,58 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             dependency_workspace=state.get("sourceWorkspacePath"),
             worktree_isolated=True,
         )
+        if direct_workspace and str(spec.get("projectStack") or "").lower() == "node":
+            target = str(spec.get("targetProjectDir") or spec.get("projectRoot") or ".")
+            project_root = Path(state["workspacePath"]) if target in {"", "."} else Path(state["workspacePath"]) / target
+            if (project_root / "package.json").is_file():
+                if (project_root / "pnpm-lock.yaml").is_file():
+                    install_command = "pnpm install"
+                elif (project_root / "yarn.lock").is_file():
+                    install_command = "yarn install"
+                elif (project_root / "bun.lock").is_file() or (project_root / "bun.lockb").is_file():
+                    install_command = "bun install"
+                else:
+                    install_command = "npm install"
+                emit("setup_commands", f"Synchronizing project dependencies with {install_command}")
+                setup_results.extend(
+                    run_setup_commands(
+                        state["workspacePath"],
+                        [install_command],
+                        target_project_dir=target,
+                    )
+                )
+        worker_result["setupCommandResults"] = setup_results
         events = state.get("brokerEvents", [])
         if run_id and subtask_id:
             with _open_broker() as broker:
                 broker.complete_subtask(run_id, subtask_id, "coder", worker_result, "failed" if worker_result.get("error") else "completed")
                 events = broker.events(run_id)
-        return {"workerAttempts": [worker_result], "retryCount": state.get("retryCount", 0) + 1, "brokerEvents": events}
+        return {
+            "workerAttempts": [worker_result],
+            "retryCount": state.get("retryCount", 0) + 1,
+            "brokerEvents": events,
+            "setupCommandResults": setup_results,
+            "setupCommandsCompleted": setup_completed,
+        }
 
     def tester_agent(state: PipelineState) -> dict[str, Any]:
         environment = state.get("executionEnvironment") or {}
         use_container = bool(environment.get("containerAvailable"))
-        emit("tester_agent", "Container-sandboxed verification" if use_container else "Host allowlist verification on isolated copy")
+        direct_workspace = bool(environment.get("directWorkspace"))
+        emit(
+            "tester_agent",
+            (
+                "Verification running in the opened workspace"
+                if direct_workspace
+                else ("Container-sandboxed verification" if use_container else "Host allowlist verification on isolated copy")
+            ),
+        )
         latest = state["workerAttempts"][-1]
         spec = latest.get("verificationSpec") or {}
         verification_commands = list(spec.get("verificationCommands") or [])
         raw_commands = list(dict.fromkeys(verification_commands or (spec.get("commandsToRun") or [])))
-        with create_workspace_sandbox(state["workspacePath"]) as verification_root:
-            verification_workspace = str(Path(verification_root) / "workspace")
+
+        def execute_verification(verification_workspace: str) -> tuple[list[dict[str, str]], list[dict[str, Any]], str]:
             commands = normalize_verification_commands(verification_workspace, raw_commands, latest, spec)
             if use_container:
                 command_results = [
@@ -960,7 +1228,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     )
                     for item in commands
                 ]
-                verification_policy = "Container command results and the latest worker output may be evaluated."
+                verification_policy = (
+                    "Container command results bind-mounted from the opened workspace may be evaluated."
+                    if direct_workspace
+                    else "Container command results and the latest worker output may be evaluated."
+                )
             else:
                 command_results = [
                     {
@@ -969,19 +1241,35 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                             item["command"],
                             cwd=item.get("cwd", "."),
                             timeout=120,
-                            sandboxed=True,
+                            sandboxed=not direct_workspace,
                         ),
                         "containerFallback": True,
+                        "directWorkspace": direct_workspace,
                     }
                     for item in commands
                 ]
-                verification_policy = "Docker/Podman is unavailable; evaluate only allowlisted host command results from the isolated verification copy and the latest worker output."
+                verification_policy = (
+                    "Evaluate allowlisted host command results from the opened workspace."
+                    if direct_workspace
+                    else "Docker/Podman is unavailable; evaluate only allowlisted host command results from the isolated verification copy and the latest worker output."
+                )
+            command_results = [_normalize_verification_result(item) for item in command_results]
+            return commands, command_results, verification_policy
+
+        if direct_workspace:
+            commands, command_results, verification_policy = execute_verification(state["workspacePath"])
+        else:
+            with create_workspace_sandbox(state["workspacePath"]) as verification_root:
+                verification_workspace = str(Path(verification_root) / "workspace")
+                commands, command_results, verification_policy = execute_verification(verification_workspace)
         affected = codegraph_affected_tests(state["workspacePath"], latest.get("changedFiles") or [])
         if affected.get("enabled") and affected.get("status") == "ok":
             emit("codegraph_affected", "Affected test candidates ready")
         review = _json(
             state,
-            "Tester Agent: interpret isolated verification results. Return JSON with blockers[], warnings[], passed boolean, finalMessage.\n"
+            "Tester Agent: interpret isolated verification results. Only failed executed commands, coder errors, or sandbox violations are blockers. "
+            "A missing optional npm script or optional Docker/Podman fallback is a warning, not a blocker. "
+            "Return JSON with blockers[], warnings[], passed boolean, finalMessage.\n"
             + json.dumps(
                 {
                     **_context(state, "tester_agent"),
@@ -994,15 +1282,25 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             ),
             {"blockers": [], "warnings": [], "passed": True, "finalMessage": ""},
         )
+        review = _sanitize_review_claims(review, environment, command_results)
+        if not use_container and not direct_workspace:
+            review.setdefault("warnings", []).append(
+                "Docker/Podman is unavailable; verification ran in the isolated host allowlist fallback."
+            )
+        for item in command_results:
+            if item.get("verificationUnavailable"):
+                review.setdefault("warnings", []).append(
+                    f"Skipped {item.get('command')}: {item.get('reason')}"
+                )
         if latest.get("error"):
             review.setdefault("blockers", []).append(f"Coder agent error: {latest['error']}")
-            review["passed"] = False
         if any((not item.get("skipped")) and (item.get("timedOut") or item.get("code") not in (0, None)) for item in command_results):
             review.setdefault("blockers", []).append("At least one verification command failed.")
-            review["passed"] = False
-        if any(not item.get("sandboxed") for item in command_results):
+        if not direct_workspace and any(not item.get("sandboxed") for item in command_results):
             review.setdefault("blockers", []).append("Verification did not run inside the required isolated verification workspace.")
-            review["passed"] = False
+        review["blockers"] = list(dict.fromkeys(map(str, review.get("blockers") or [])))
+        review["warnings"] = list(dict.fromkeys(map(str, review.get("warnings") or [])))
+        review["passed"] = not review["blockers"]
         tester_result = {
             **review,
             "commandResults": command_results,
@@ -1014,8 +1312,12 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 "policyViolations": latest.get("policyViolations", []),
                 "verificationSpec": latest.get("verificationSpec", {}),
             },
-            "verificationWorkspaceIsolated": True,
-            "verificationMode": "container" if use_container else "host_allowlist",
+            "verificationWorkspaceIsolated": not direct_workspace,
+            "verificationMode": (
+                "direct_container"
+                if direct_workspace and use_container
+                else ("direct_host" if direct_workspace else ("container" if use_container else "host_allowlist"))
+            ),
         }
         telemetry.record_verification(bool(tester_result.get("passed")))
         run_id = state.get("brokerRunId")
@@ -1033,13 +1335,20 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         fallback = security_review_fallback(state["problem"], latest, state.get("testerResult") or {}, state.get("governanceDecision") or {})
         review = _json(
             state,
-            "Security Reviewer Agent: review policy, auth, secret, permission, injection, destructive action, and sandbox violations. Return JSON with blockers[], warnings[], riskClass, reviewFocus[], passed boolean.\n"
+            "Security Reviewer Agent: review policy, auth, secret, permission, injection, destructive action, and sandbox violations. "
+            "Docker/Podman absence is not a blocker when containerRequired is false and verification used the isolated host allowlist fallback. "
+            "Return JSON with blockers[], warnings[], riskClass, reviewFocus[], passed boolean.\n"
             + json.dumps(_context(state, "security_reviewer_agent"), ensure_ascii=False),
             fallback,
         )
+        environment = state.get("executionEnvironment") or {}
+        review = _sanitize_review_claims(
+            review,
+            environment,
+            list((state.get("testerResult") or {}).get("commandResults") or []),
+        )
         review["blockers"] = list(dict.fromkeys([*map(str, fallback.get("blockers") or []), *map(str, review.get("blockers") or [])]))
         review["warnings"] = list(dict.fromkeys([*map(str, fallback.get("warnings") or []), *map(str, review.get("warnings") or [])]))
-        environment = state.get("executionEnvironment") or {}
         review["sandboxed"] = bool(environment.get("containerAvailable"))
         review["executionMode"] = environment.get("executionMode") or "container"
         review["passed"] = not review.get("blockers")
@@ -1058,13 +1367,21 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         fallback = code_review_fallback(state.get("testerResult") or {}, state.get("securityReview") or {})
         review = _json(
             state,
-            "Code Reviewer Agent: decide correctness, maintainability, regression risk, and merge readiness. Return JSON with blockers[], warnings[], passed boolean, finalMessage.\n"
+            "Code Reviewer Agent: decide correctness, maintainability, regression risk, and merge readiness. "
+            "Do not require an npm test script that the project does not define when its selected build/check commands pass. "
+            "Optional Docker/Podman fallback is a warning, not a blocker. "
+            "Return JSON with blockers[], warnings[], passed boolean, finalMessage.\n"
             + json.dumps(_context(state, "code_reviewer_agent"), ensure_ascii=False),
             fallback,
         )
+        review = _sanitize_review_claims(
+            review,
+            state.get("executionEnvironment") or {},
+            list((state.get("testerResult") or {}).get("commandResults") or []),
+        )
         review["blockers"] = list(dict.fromkeys([*map(str, fallback.get("blockers") or []), *map(str, review.get("blockers") or [])]))
         review["warnings"] = list(dict.fromkeys([*map(str, fallback.get("warnings") or []), *map(str, review.get("warnings") or [])]))
-        review["passed"] = not review.get("blockers") and bool(review.get("passed", True))
+        review["passed"] = not review.get("blockers")
         review["upstreamEvidence"] = state.get("securityReview") or {}
         run_id = state.get("brokerRunId")
         events = state.get("brokerEvents", [])
@@ -1114,10 +1431,17 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 broker.record_event(run_id, None, "reviewer", "reviewer_decision", {"passed": review.get("passed"), "blockers": review.get("blockers", [])})
                 retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2)))
                 will_rework = bool(review.get("blockers")) and state.get("retryCount", 0) <= retry_limit
+                auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
+                auto_cycle_limit = int(DEFAULT_WORKFLOW.limits.get("maxAutoApprovalCycles", 1))
+                can_auto_grant = auto_confirm and int(state.get("reworkCycle", 0)) < auto_cycle_limit
                 if will_rework:
                     telemetry.record_rework()
-                needs_gate = bool(review.get("blockers")) and not will_rework and not latest.get("error")
-                status = "needs_rework" if will_rework else ("completed" if review.get("passed") else ("pending_approval" if needs_gate else "blocked"))
+                needs_gate = bool(review.get("blockers")) and not will_rework and not latest.get("error") and not auto_confirm
+                status = (
+                    "needs_rework"
+                    if will_rework or (bool(review.get("blockers")) and can_auto_grant)
+                    else ("completed" if review.get("passed") else ("pending_approval" if needs_gate else "blocked"))
+                )
                 broker.finish_run(
                     run_id,
                     status,
@@ -1125,11 +1449,46 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 )
                 events = broker.events(run_id)
                 review["brokerEvents"] = events
-        return {"latestReview": review, "reviewerDecision": decision, "reviewFindings": [review], "brokerEvents": events}
+        return {
+            "latestReview": review,
+            "reviewerDecision": decision,
+            "reviewFindings": [review],
+            "brokerEvents": events,
+            "autoReworkGranted": False,
+        }
 
     def execution_gate(state: PipelineState) -> dict[str, Any]:
-        emit("execution_gate", "Bounded rework limit reached; human approval required")
         grant = int(DEFAULT_WORKFLOW.limits.get("approvalGrantAttempts", 1))
+        auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
+        auto_cycle_limit = int(DEFAULT_WORKFLOW.limits.get("maxAutoApprovalCycles", 1))
+        current_cycle = int(state.get("reworkCycle", 0))
+        if auto_confirm and current_cycle < auto_cycle_limit:
+            retry_count = int(state.get("retryCount", 0))
+            emit("execution_gate", f"Auto-confirm enabled; granting {grant} bounded rework attempt(s)")
+            return {
+                "retryLimit": retry_count + grant - 1,
+                "reworkCycle": current_cycle + 1,
+                "autoReworkGranted": True,
+            }
+
+        if auto_confirm:
+            emit("execution_gate", "Auto-confirm rework budget exhausted; finishing without approval prompt")
+            review = state.get("latestReview") or {}
+            return {
+                "autoReworkGranted": False,
+                "result": {
+                    "assistantText": (
+                        "Đã dùng hết ngân sách sửa tự động. Run kết thúc mà không yêu cầu xác nhận; "
+                        "các thay đổi chưa đạt review sẽ được rollback."
+                    ),
+                    "changedFiles": (state.get("workerAttempts") or [{}])[-1].get("changedFiles", []),
+                    "commandResults": review.get("commandResults", []),
+                    "review": review,
+                    "reworkAttempts": state.get("workerAttempts", []),
+                },
+            }
+
+        emit("execution_gate", "Bounded rework limit reached; human approval required")
         next_cycle = int(state.get("reworkCycle", 0)) + 1
         review = state.get("latestReview") or {}
         reason = (
@@ -1217,6 +1576,17 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         result = dict(state.get("result") or {})
         worktree = state.get("worktreeInfo") or {}
         review = result.get("review") or state.get("latestReview") or {}
+        if worktree.get("mode") == "direct-workspace":
+            latest = (state.get("workerAttempts") or [{}])[-1]
+            result["changedFiles"] = list(latest.get("changedFiles") or [])
+            result["directWorkspace"] = True
+            result["setupCommandResults"] = list(state.get("setupCommandResults") or [])
+            if not review.get("passed"):
+                result["assistantText"] = (
+                    str(result.get("assistantText") or "")
+                    + "\n\nCác thay đổi và dependency đã được giữ trực tiếp trong workspace để bạn tiếp tục xử lý."
+                )
+            return {"result": result}
         if not state.get("workerAttempts"):
             cleanup_execution_worktree(worktree)
             return {"result": result}
@@ -1262,6 +1632,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             "can_rework": bool(blockers) and retry_count <= retry_limit,
             "retry_count": retry_count,
             "retry_limit": retry_limit,
+            "auto_rework_granted": bool(state.get("autoReworkGranted")),
         }
 
     agent_roles = {
@@ -1387,6 +1758,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
     approval = dict(payload.get("humanGateApproval") or {})
     approval_granted = str(approval.get("status") or "").lower() == "approved"
     approval_kind = str(approval.get("kind") or "")
+    admission = classify_execution(str(payload["content"]))
+    execution_class = str(admission["executionClass"])
     previous_retry_count = max(0, int(approval.get("retryCount") or 0)) if approval_kind == "rework_limit" else 0
     configured_grant = max(1, int(DEFAULT_WORKFLOW.limits.get("approvalGrantAttempts", 1)))
     retry_limit = int(DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2))
@@ -1402,14 +1775,22 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
         "messages": payload.get("messages", []),
         "sessionId": payload.get("sessionId") or str(uuid.uuid4()),
         "executionId": execution_id,
+        "executionClass": execution_class,
+        "taskIntent": dict(admission["taskIntent"]),
         "retryCount": previous_retry_count,
         "retryLimit": retry_limit,
         "reworkCycle": int(approval.get("reworkCycle") or 0),
         "correlationId": correlation_id,
     }
-    durable_db_path = _state_dir() / "durable-executions.sqlite"
+    state_dir = _state_dir()
+    durable_db_path = control_plane_path(state_dir)
     supervisor = DurableExecutionStore(durable_db_path)
     try:
+        migrate_legacy_tables(
+            durable_db_path,
+            state_dir / "durable-executions.sqlite",
+            ("durable_executions", "durable_steps"),
+        )
         execution = supervisor.prepare(
             execution_id=execution_id,
             session_id=state["sessionId"],
@@ -1435,7 +1816,26 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
         emit("resume", f"Returning durable result for execution {execution_id}")
         supervisor.close()
         return execution["result"]
-    worktree_info = prepare_execution_worktree(source_workspace, execution_id)
+    direct_workspace = bool(settings.get("directWorkspaceMode", True))
+    if execution_class == "read_only":
+        worktree_info = {
+            "ready": False,
+            "mode": "read-only",
+            "executionId": execution_id,
+            "sourceWorkspace": source_workspace,
+        }
+    elif direct_workspace:
+        worktree_info = {
+            "ready": True,
+            "mode": "direct-workspace",
+            "executionId": execution_id,
+            "sourceWorkspace": source_workspace,
+            "sourceRepoRoot": source_workspace,
+            "workspacePath": source_workspace,
+        }
+        emit("workspace_mode", "Direct workspace mode: files, installs and verification stay in the opened folder")
+    else:
+        worktree_info = prepare_execution_worktree(source_workspace, execution_id)
     state["worktreeInfo"] = worktree_info
     if worktree_info.get("ready"):
         state["workspacePath"] = str(worktree_info["workspacePath"])
@@ -1483,6 +1883,7 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
                                         "messages": state["messages"],
                                         "correlationId": correlation_id,
                                         "executionId": execution_id,
+                                        "executionClass": execution_class,
                                         "workspacePath": state["workspacePath"],
                                         "sourceWorkspacePath": source_workspace,
                                         "worktreeInfo": worktree_info,

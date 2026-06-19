@@ -92,6 +92,56 @@ def _git_root(workspace: Path) -> Path | None:
     return Path(result.stdout.strip()).resolve()
 
 
+def _ensure_repository_head(repository: Path) -> tuple[bool, str]:
+    head = _git(["rev-parse", "--verify", "HEAD"], repository)
+    if head.returncode == 0:
+        return False, ""
+    commit = _git(
+        [
+            "-c",
+            "user.name=Local Agent",
+            "-c",
+            "user.email=local-agent@localhost",
+            "commit",
+            "--allow-empty",
+            "--only",
+            "--no-gpg-sign",
+            "-m",
+            "Initialize workspace",
+        ],
+        repository,
+    )
+    if commit.returncode != 0:
+        return False, (commit.stderr or commit.stdout or "initial git commit failed").strip()
+    return True, ""
+
+
+def _bootstrap_empty_repository(workspace: Path) -> tuple[Path | None, str]:
+    try:
+        is_empty = workspace.is_dir() and next(workspace.iterdir(), None) is None
+    except OSError as exc:
+        return None, f"Could not inspect the selected workspace: {exc}"
+    if not is_empty:
+        return (
+            None,
+            "The selected workspace contains files but is not inside a Git repository; "
+            "secure write tasks require worktree-per-execution.",
+        )
+
+    git_dir = workspace / ".git"
+    initialized = False
+    try:
+        init = _git(["init"], workspace)
+        if init.returncode != 0:
+            return None, (init.stderr or init.stdout or "git init failed").strip()
+        initialized = True
+        return workspace.resolve(), ""
+    except Exception as exc:
+        if initialized and git_dir.exists():
+            shutil.rmtree(git_dir, ignore_errors=True)
+        return None, f"Could not initialize Git for the empty workspace: {exc}"
+
+
 def _safe_relative(path: Path, root: Path) -> str:
     relative = path.resolve().relative_to(root.resolve()).as_posix()
     return "." if relative == "." else relative
@@ -237,12 +287,28 @@ def _sync_source_to_worktree(source: Path, target: Path) -> None:
 def prepare_execution_worktree(workspace: str, execution_id: str) -> dict[str, Any]:
     source_workspace = Path(workspace).resolve()
     source_repo = _git_root(source_workspace)
+    initialized_repo = False
     if source_repo is None:
+        source_repo, reason = _bootstrap_empty_repository(source_workspace)
+        if source_repo is None:
+            return {
+                "ready": False,
+                "mode": "unavailable",
+                "reason": reason,
+                "sourceWorkspace": str(source_workspace),
+            }
+        initialized_repo = True
+
+    initialized_head, reason = _ensure_repository_head(source_repo)
+    if reason:
+        if initialized_repo:
+            shutil.rmtree(source_repo / ".git", ignore_errors=True)
         return {
             "ready": False,
             "mode": "unavailable",
-            "reason": "The selected workspace is not inside a Git repository; secure write tasks require worktree-per-execution.",
+            "reason": f"Could not create an initial Git commit for worktree isolation: {reason}",
             "sourceWorkspace": str(source_workspace),
+            "sourceRepoRoot": str(source_repo),
         }
 
     relative_workspace = _safe_relative(source_workspace, source_repo)
@@ -299,6 +365,8 @@ def prepare_execution_worktree(workspace: str, execution_id: str) -> dict[str, A
         "workspacePath": str(selected_worktree),
         "baselinePath": str(baseline_path),
         "reused": reused,
+        "bootstrappedRepo": initialized_repo or initialized_head,
+        "initializedHead": initialized_head,
     }
     write_debug_event("worktree.prepared", info)
     return info

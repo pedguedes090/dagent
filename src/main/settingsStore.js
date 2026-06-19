@@ -7,7 +7,8 @@ const DEFAULT_SETTINGS = {
   serverUrl: "http://localhost:20128/v1",
   model: "gemini/gemini-3.1-flash-lite",
   apiKey: "",
-  autoConfirmHumanGate: false
+  autoConfirmHumanGate: false,
+  directWorkspaceMode: true
 };
 
 function ensureDir(dirPath) {
@@ -111,7 +112,10 @@ class SettingsStore {
     const cleaned = {
       serverUrl: String(nextSettings.serverUrl || current.serverUrl).trim().replace(/\/+$/, ""),
       model: String(nextSettings.model || current.model).trim(),
-      autoConfirmHumanGate: Boolean(nextSettings.autoConfirmHumanGate)
+      autoConfirmHumanGate: Boolean(nextSettings.autoConfirmHumanGate),
+      directWorkspaceMode: Object.prototype.hasOwnProperty.call(nextSettings, "directWorkspaceMode")
+        ? Boolean(nextSettings.directWorkspaceMode)
+        : Boolean(current.directWorkspaceMode)
     };
     const finalSettings = {
       ...DEFAULT_SETTINGS,

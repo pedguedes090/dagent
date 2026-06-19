@@ -8,7 +8,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -174,14 +173,14 @@ class ServerSmokeTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
-    def test_autonomy_idle_scan_is_rejected_when_run_lock_active(self) -> None:
+    def test_autonomy_idle_scan_runs_while_write_lock_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as workspace:
             old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
             os.environ["AGENT_ENGINE_STATE_DIR"] = temp_dir
             httpd = agent_server.ThreadingHTTPServer(("127.0.0.1", 0), agent_server.AgentRequestHandler)
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             thread.start()
-            self.assertTrue(agent_server._RUN_LOCK.acquire(blocking=False))
+            self.assertTrue(agent_server._WRITE_LOCK.acquire(blocking=False))
             try:
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{httpd.server_port}/v1/autonomy/idle-scan",
@@ -189,14 +188,13 @@ class ServerSmokeTests(unittest.TestCase):
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(request, timeout=5)
-                self.assertEqual(raised.exception.code, 409)
-                body = json.loads(raised.exception.read().decode("utf-8"))
-                self.assertEqual(body["error"], "run_lock_active")
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(body["ok"])
+                self.assertTrue(body["writeLockActive"])
             finally:
-                if agent_server._RUN_LOCK.locked():
-                    agent_server._RUN_LOCK.release()
+                if agent_server._WRITE_LOCK.locked():
+                    agent_server._WRITE_LOCK.release()
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=5)
@@ -205,7 +203,7 @@ class ServerSmokeTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
-    def test_server_queues_second_run_behind_global_lock(self) -> None:
+    def test_server_queues_second_write_run_behind_write_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
             os.environ["AGENT_ENGINE_STATE_DIR"] = temp_dir
@@ -268,6 +266,63 @@ class ServerSmokeTests(unittest.TestCase):
                 self.assertTrue(any(item.get("type") == "result" for item in second_messages))
             finally:
                 release_first.set()
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
+    def test_read_only_run_does_not_wait_for_write_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+            os.environ["AGENT_ENGINE_STATE_DIR"] = temp_dir
+            httpd = agent_server.ThreadingHTTPServer(("127.0.0.1", 0), agent_server.AgentRequestHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            self.assertTrue(agent_server._WRITE_LOCK.acquire(blocking=False))
+            try:
+                with mock.patch.object(
+                    agent_server,
+                    "run_pipeline",
+                    return_value={
+                        "id": "exec-read",
+                        "executionId": "exec-read",
+                        "assistantText": "summary",
+                        "changedFiles": [],
+                        "commandResults": [],
+                        "review": {},
+                    },
+                ):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{httpd.server_port}/v1/runs",
+                        data=json.dumps(
+                            {
+                                "sessionId": "session-read",
+                                "workspacePath": temp_dir,
+                                "content": "đọc README.md và tóm tắt, không sửa",
+                                "settings": {"serverUrl": "http://model.test/v1", "model": "test-model", "apiKey": ""},
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        body = response.read().decode("utf-8")
+
+                messages = [json.loads(line) for line in body.splitlines() if line.strip()]
+                self.assertFalse(any(item.get("stage") == "queued" for item in messages))
+                self.assertTrue(
+                    any(
+                        item.get("stage") == "running" and "Read-only lane" in item.get("detail", "")
+                        for item in messages
+                    )
+                )
+                self.assertTrue(any(item.get("type") == "result" for item in messages))
+            finally:
+                if agent_server._WRITE_LOCK.locked():
+                    agent_server._WRITE_LOCK.release()
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=5)

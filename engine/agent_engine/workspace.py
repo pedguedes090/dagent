@@ -584,9 +584,24 @@ def _read_package_scripts(workspace: str, cwd: str) -> dict[str, Any]:
     root = Path(workspace).resolve()
     package_path = root / ("" if cwd == "." else cwd) / "package.json"
     try:
-        return json.loads(package_path.read_text(encoding="utf-8", errors="replace")).get("scripts", {})
+        scripts = json.loads(package_path.read_text(encoding="utf-8", errors="replace")).get("scripts", {})
+        return scripts if isinstance(scripts, dict) else {}
     except Exception:
         return {}
+
+
+def _has_package_manifest(workspace: str, cwd: str) -> bool:
+    root = Path(workspace).resolve()
+    return (root / ("" if cwd == "." else cwd) / "package.json").is_file()
+
+
+def _package_script_for_command(command: str) -> str | None:
+    normalized = " ".join(str(command or "").strip().lower().split())
+    direct = re.match(r"^(?:npm|pnpm|yarn)\s+test(?:\s|$)", normalized)
+    if direct:
+        return "test"
+    scripted = re.match(r"^(?:npm|pnpm|yarn)\s+run\s+([a-z0-9:_-]+)(?:\s|$)", normalized)
+    return scripted.group(1) if scripted else None
 
 
 def _split_cd_command(command: str) -> tuple[str | None, str]:
@@ -624,6 +639,12 @@ def normalize_verification_commands(
         if lower.startswith(("npm run dev", "npm run preview", "vite ")):
             continue
 
+        script = _package_script_for_command(command)
+        if script and _has_package_manifest(workspace, cwd):
+            scripts = _read_package_scripts(workspace, cwd)
+            if script not in scripts:
+                continue
+
         key = (cwd, command)
         if key not in seen:
             normalized.append({"cwd": cwd, "command": command})
@@ -636,6 +657,172 @@ def normalize_verification_commands(
         normalized.append({"cwd": default_cwd, "command": "npm test"})
 
     return normalized[:5]
+
+
+def _is_safe_setup_command(command: str) -> bool:
+    normalized = " ".join(str(command or "").strip().split())
+    lower = normalized.lower()
+    if not normalized or any(token in normalized for token in (";", "&", "|", "<", ">", "`", "\n", "\r")):
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9@_+.,:/\\=\-\s]+", normalized):
+        return False
+    return lower.startswith(
+        (
+            "npm create ",
+            "npm init ",
+            "npm install",
+            "npm i ",
+            "npx create-",
+            "pnpm create ",
+            "pnpm install",
+            "pnpm add ",
+            "yarn create ",
+            "yarn install",
+            "yarn add ",
+            "bun create ",
+            "bun install",
+            "bun add ",
+            "python -m pip install ",
+            "py -m pip install ",
+            "pip install ",
+            "uv add ",
+            "uv sync",
+        )
+    )
+
+
+def run_setup_commands(
+    workspace: str,
+    commands: list[str],
+    *,
+    target_project_dir: str = ".",
+    timeout: int = 300,
+) -> list[dict[str, Any]]:
+    root = Path(workspace).resolve()
+    target = _normalize_policy_path(target_project_dir) or "."
+    current = root
+    results: list[dict[str, Any]] = []
+
+    for raw in list(dict.fromkeys(map(str, commands or [])))[:12]:
+        command = raw.strip()
+        if not command:
+            continue
+        cwd, command_after_cd = _split_cd_command(command)
+        if cwd and not command_after_cd:
+            candidate = (root / cwd).resolve()
+            if candidate != root and root not in candidate.parents:
+                results.append({"command": command, "cwd": ".", "skipped": True, "reason": "Setup cwd escapes workspace."})
+                continue
+            if not candidate.is_dir():
+                results.append({"command": command, "cwd": ".", "skipped": True, "reason": "Setup cwd does not exist yet."})
+                continue
+            current = candidate
+            results.append({"command": command, "cwd": relpath(current, root), "skipped": True, "reason": "Changed setup working directory."})
+            continue
+
+        if cwd:
+            candidate = (root / cwd).resolve()
+            if candidate != root and root not in candidate.parents:
+                results.append({"command": command, "cwd": ".", "skipped": True, "reason": "Setup cwd escapes workspace."})
+                continue
+            current = candidate
+            command = command_after_cd
+
+        lower = command.lower()
+        target_root = root if target == "." else (root / target).resolve()
+        is_scaffold = lower.startswith(("npm create ", "npm init ", "npx create-", "pnpm create ", "yarn create ", "bun create "))
+        is_install = lower.startswith(
+            (
+                "npm install",
+                "npm i ",
+                "pnpm install",
+                "pnpm add ",
+                "yarn install",
+                "yarn add ",
+                "bun install",
+                "bun add ",
+            )
+        )
+        if is_scaffold and (target_root / "package.json").is_file():
+            results.append(
+                {
+                    "command": command,
+                    "cwd": relpath(current, root),
+                    "skipped": True,
+                    "reason": "Target project already exists.",
+                }
+            )
+            continue
+        if is_install and current == root and target_root.is_dir() and (target_root / "package.json").is_file():
+            current = target_root
+
+        relative_cwd = relpath(current, root)
+        if not _is_safe_setup_command(command):
+            results.append(
+                {
+                    "command": command,
+                    "cwd": relative_cwd,
+                    "skipped": True,
+                    "reason": "Command is not in the direct-workspace setup allowlist.",
+                }
+            )
+            continue
+        if not current.is_dir():
+            results.append(
+                {
+                    "command": command,
+                    "cwd": relative_cwd,
+                    "skipped": True,
+                    "reason": "Setup working directory does not exist.",
+                }
+            )
+            continue
+
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(current),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            results.append(
+                {
+                    "command": command,
+                    "cwd": relative_cwd,
+                    "code": proc.returncode,
+                    "stdout": proc.stdout[-20000:],
+                    "stderr": proc.stderr[-20000:],
+                    "timedOut": False,
+                    "directWorkspace": True,
+                }
+            )
+        except subprocess.TimeoutExpired as exc:
+            results.append(
+                {
+                    "command": command,
+                    "cwd": relative_cwd,
+                    "code": None,
+                    "stdout": str(exc.stdout or "")[-20000:],
+                    "stderr": str(exc.stderr or "")[-20000:],
+                    "timedOut": True,
+                    "directWorkspace": True,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "command": command,
+                    "cwd": relative_cwd,
+                    "code": None,
+                    "stdout": "",
+                    "stderr": str(exc),
+                    "timedOut": False,
+                    "directWorkspace": True,
+                }
+            )
+    return results
 
 
 def is_safe_command(command: str) -> bool:
