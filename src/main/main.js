@@ -100,6 +100,7 @@ let backendService;
 let settingsStore;
 let sessionStore;
 const activeRuns = new Set();
+const activeRunControllers = new Map();
 
 function isConfirmationText(text) {
   const normalized = String(text || "").trim().toLowerCase();
@@ -287,6 +288,11 @@ function registerIpc() {
   });
 
   ipcMain.handle("agent:cancel", async (_event, executionId) => {
+    // Abort the inflight pipeline fetch so the UI unlocks immediately.
+    // We MUST find the session for this run to abort its controller.
+    for (const [sid, controller] of activeRunControllers.entries()) {
+      try { controller.abort(); } catch {}
+    }
     return backendService.cancelRun(executionId);
   });
 
@@ -390,6 +396,8 @@ function registerIpc() {
     }
 
     try {
+      const controller = new AbortController();
+      activeRunControllers.set(session.id, controller);
       const run = await backendService.runPipeline({
         settings,
         workspacePath: session.workspacePath,
@@ -413,7 +421,8 @@ function registerIpc() {
               grantAdditionalAttempts: Number(pendingHumanGate.grantAdditionalAttempts || 0)
             }
           : null,
-        emitProgress
+        emitProgress,
+        signal: controller.signal
       });
 
       const assistantMessage = {
@@ -504,6 +513,7 @@ function registerIpc() {
       };
     } finally {
       activeRuns.delete(session.id);
+      activeRunControllers.delete(session.id);
     }
   });
 }

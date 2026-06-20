@@ -64,19 +64,28 @@ const appApi = window.agentApp || (() => {
       // Server now emits X-Execution-Id header AND a first {type:"ready",executionId} line.
       window.__currentExecutionId = r.headers.get("X-Execution-Id") || null;
       const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "", result = null;
-      while (true) {
-        const { done, value } = await reader.read(); if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split(/\r?\n/); buf = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const m = JSON.parse(line);
-            if (m.type === "ready" && m.executionId) window.__currentExecutionId = m.executionId;
-            if (m.type === "progress") { window.dispatchEvent(new CustomEvent("agent:progress", { detail: m })); }
-            if (m.type === "result") result = m.result;
-          } catch(e) {}
+      try {
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split(/\r?\n/); buf = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const m = JSON.parse(line);
+              if (m.type === "ready" && m.executionId) window.__currentExecutionId = m.executionId;
+              if (m.type === "progress") { window.dispatchEvent(new CustomEvent("agent:progress", { detail: m })); }
+              if (m.type === "result") result = m.result;
+            } catch(e) {}
+          }
         }
+      } catch (e) {
+        if (e?.name === "AbortError") {
+          // Stream was aborted by the Stop button — the backend will notice
+          // the broken pipe and cancel at the next node boundary.
+          return { id: window.__currentExecutionId || "cancelled", executionId: window.__currentExecutionId || "cancelled", cancelled: true };
+        }
+        throw e;
       }
       if (buf.trim()) { try { const m = JSON.parse(buf.trim()); if (m.type === "result") result = m.result; } catch(e) {} }
       if (!result) throw new Error("Backend returned no result");
@@ -1304,24 +1313,47 @@ async function cancelCurrentRun() {
     return;
   }
   setStatus("Đang dừng pipeline...", 2400);
-  // 1) Tell the backend to honor the cancel at the next node boundary.
-  if (execId) {
-    try {
-      if (typeof appApi.cancelRun === "function") await appApi.cancelRun(execId);
-    } catch (e) { console.warn("cancelRun:", e); }
-  }
-  // 2) Abort the inflight fetch if the renderer owns it (web-fallback path).
+  // 1) Abort the inflight fetch — this returns a {cancelled:true} result
+  //    immediately so runTask's await unwinds and state.running flips to false
+  //    within milliseconds, re-enabling all controls. The backend detects the
+  //    broken pipe and cancels at the next node boundary.
   if (window.__currentSendController) {
     try { window.__currentSendController.abort(); } catch (e) {}
     window.__currentSendController = null;
   }
-  // UI feedback — backend may take seconds to actually unwind.
+  // 2) Tell the backend to honor the cancel at the next node boundary (fire
+  //    and forget — the stream abort above is the primary kill switch).
+  if (execId) {
+    (async () => {
+      try {
+        if (typeof appApi.cancelRun === "function") {
+          await appApi.cancelRun(execId);
+        } else {
+          // Web-fallback path: resolve base manually
+          const base = state.settings?.serverUrl || `http://127.0.0.1:${window.location.port || 20128}`;
+          await fetch(`${base}/v1/runs/cancel`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ executionId: execId }),
+            signal: AbortSignal.timeout(3000),
+          });
+        }
+      } catch {}
+    })();
+  }
+  // 3) Unlock the UI immediately — don't wait for backend acknowledgment.
+  state.running = false;
+  state.currentExecutionId = null;
   state.progress.push({
     stage: "cancelled",
-    detail: "Đã gửi yêu cầu dừng — chờ pipeline kết thúc node hiện tại",
+    detail: "Đã dừng — pipeline sẽ kết thúc node hiện tại",
     at: new Date().toISOString(),
   });
   render();
+  // The finally block in runTask will also fire concurrently via the
+  // abort pathway, but re-running render() + focus is harmless and keeps
+  // the UI responsive during the cancel window.
+  if (E.messageInput) E.messageInput.focus();
 }
 
 function autoResizeInput() {

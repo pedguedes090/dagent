@@ -141,7 +141,8 @@ class AgentBackendService {
     humanGateApproval,
     emitProgress,
     correlationId,
-    executionId
+    executionId,
+    signal
   }) {
     const endpoint = await this.start();
     const response = await fetch(`${endpoint}/v1/runs`, {
@@ -159,11 +160,14 @@ class AgentBackendService {
         settings,
         messages,
         humanGateApproval
-      })
+      }),
+      signal
     });
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
+      // AbortError → caller will handle cancellation gracefully
+      if (signal?.aborted) throw new Error("Pipeline cancelled");
       throw new Error(`Agent backend loi ${response.status}: ${body.slice(0, 800)}`);
     }
 
@@ -174,9 +178,21 @@ class AgentBackendService {
     let engineError = null;
 
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      try {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+      } catch (e) {
+        if (signal?.aborted) {
+          reader.cancel("cancelled");
+          return { id: executionId, executionId, cancelled: true };
+        }
+        throw e;
+      }
+      if (signal?.aborted) {
+        reader.cancel("cancelled");
+        return { id: executionId, executionId, cancelled: true };
+      }
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || "";
       for (const line of lines) {
