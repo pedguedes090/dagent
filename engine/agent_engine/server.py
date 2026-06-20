@@ -339,12 +339,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             if event_type:
                 message["eventType"] = event_type
             # Allowlisted enrichment kwargs — copy non-None values through.
+            # Keep in sync with src/main/backendService.js ENRICHED list.
             ALLOWED = (
                 "agent_role", "from_agent", "to_agent",
                 "duration_ms", "model", "tool", "status",
                 "input_summary", "output_summary",
                 "retry_count", "review_cycle",
                 "token_usage", "warnings", "error", "route_label",
+                # Agent I/O Inspector fields
+                "prompt_template", "input", "output", "output_delta",
+                "tool_input", "tool_result", "changed_files",
+                "evidence", "blockers", "confidence",
+                "sequence", "issue_count", "passed",
             )
             for key in ALLOWED:
                 if key in fields and fields[key] is not None:
@@ -490,6 +496,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         completed_ids = set(map(str, payload.get("completedIds") or []))
         idea_cursor = int(payload.get("ideaCursor") or 0)
         rescan_if_stale = bool(payload.get("rescanIfStale"))
+        product_goal = str(payload.get("productGoal") or "").strip()
 
         state_dir = _state_dir_path()
         report = (autonomy_status(state_dir) or {}).get("lastReport")
@@ -506,7 +513,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 finally:
                     _AUTONOMY_LOCK.release()
 
-        task = select_next_task(report, completed_ids, idea_cursor=idea_cursor)
+        task = select_next_task(report, completed_ids, idea_cursor=idea_cursor, product_goal=product_goal)
         next_cursor = idea_cursor
         if task and task.get("kind") == "enhancement_idea":
             next_cursor = (idea_cursor + 1) % 8  # pool size; small constant ok here.

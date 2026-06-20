@@ -330,7 +330,8 @@ function registerIpc() {
     if (!session) {
       session = sessionStore.create({
         title: payload?.content,
-        workspacePath: payload?.workspacePath || ""
+        workspacePath: payload?.workspacePath || "",
+        productGoal: String(payload?.content || payload?.task || "").trim()
       });
     }
 

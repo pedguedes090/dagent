@@ -593,60 +593,234 @@ def _format_finding_task(finding: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _compute_goal_alignment(goal: str, finding: dict[str, Any]) -> float:
+    """Crude but fast keyword-overlap similarity between user goal and finding.
+    Returns 0.0–1.0. Embedding-based would be better but requires an LLM call;
+    this runs locally in <1ms as a first-pass filter."""
+    goal_words = set(_tokenize(goal))
+    finding_text = " ".join(
+        str(finding.get(key, ""))
+        for key in ("title", "source", "evidence", "recommendation")
+    ).lower()
+    finding_words = set(_tokenize(finding_text))
+    if not goal_words or not finding_words:
+        return 0.0
+    overlap = goal_words & finding_words
+    return min(1.0, len(overlap) / max(1, len(goal_words)) * 0.7 + len(overlap) / max(1, len(finding_words)) * 0.3)
+
+
+def _tokenize(text: str) -> set[str]:
+    """Simple word tokenizer for Vietnamese + English text."""
+    import re as _re
+    return set(
+        w for w in _re.split(r"[^\w-ɏ]+", text.lower())
+        if len(w) > 1 and w not in STOP_WORDS
+    )
+
+
+def _detect_agent_engine_workspace(report: dict[str, Any] | None) -> bool:
+    """Returns True when the workspace IS the fractal-agent-system itself."""
+    if not report:
+        return False
+    wp = str(report.get("workspacePath") or "").lower()
+    return any(
+        marker in wp
+        for marker in ("fractal-agent", "agent_engine", "agent-engine")
+    )
+
+
+def _build_product_enhancement_pool(
+    goal: str,
+    report: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Generate 6–8 product-aligned task templates from the user's goal.
+    Uses static templates with keyword substitution when the goal matches
+    common product categories (movie/streaming, e-commerce, dashboard, etc.),
+    falling back to a generic capability-builder set."""
+    goal_lower = goal.lower()
+    workspace = str((report or {}).get("workspacePath") or "")
+    wp = workspace.replace("\\", "/").lower()
+
+    # Detect product type
+    product_type = _detect_product_type(goal_lower, wp)
+    if product_type:
+        return _build_typed_pool(goal, product_type, report)
+    return _build_generic_pool(goal, report)
+
+
+def _detect_product_type(goal: str, wp: str) -> str | None:
+    signals = {
+        "streaming_movie": ["phim", "xem phim", "movie", "streaming", "video", "netflix", "flix", "stream", "playlist", "cinema"],
+        "ecommerce": ["shop", "bán hàng", "mua", "cart", "order", "checkout", "product"],
+        "dashboard": ["dashboard", "bảng điều khiển", "analytics", "chart", "biểu đồ", "report", "báo cáo"],
+        "blog": ["blog", "post", "article", "bài viết", "cms", "content"],
+        "game": ["game", "trò chơi", "play", "score", "level"],
+        "chat": ["chat", "message", "messenger", "nhắn tin", "realtime"],
+    }
+    for ptype, words in signals.items():
+        if any(w in goal or w in wp for w in words):
+            return ptype
+    return None
+
+
+def _build_typed_pool(
+    goal: str,
+    product_type: str,
+    report: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return capability-builder tasks specific to the detected product type."""
+    templates: dict[str, list[dict[str, Any]]] = {
+        "streaming_movie": [
+            {"id": "prod-home", "title": "Trang chủ/catalog phim", "task": "Xây dựng hoặc cải thiện trang chủ hiển thị danh sách phim: carousel phim nổi bật, grid phim mới nhất, lọc theo thể loại. Kiểm tra responsive và loading/error states.", "alignmentScore": 0.95},
+            {"id": "prod-search", "title": "Tìm kiếm & khám phá phim", "task": "Thêm chức năng tìm kiếm phim theo từ khóa (tên phim, diễn viên, đạo diễn). Debounce input, hiển thị results dropdown, empty state khi không tìm thấy.", "alignmentScore": 0.92},
+            {"id": "prod-detail", "title": "Trang chi tiết phim", "task": "Xây dựng trang chi tiết phim: poster, tiêu đề, năm, rating IMDb, mô tả, danh sách diễn viên, phim liên quan. Layout responsive với video player embed.", "alignmentScore": 0.94},
+            {"id": "prod-player", "title": "Video player + controls", "task": "Cải thiện video player: play/pause, seek, volume, fullscreen, quality selector, loading spinner, error fallback (video không khả dụng). Kiểm tra cross-browser.", "alignmentScore": 0.90},
+            {"id": "prod-watchlist", "title": "Watchlist / danh sách yêu thích", "task": "Thêm nút 'Yêu thích'/'Xem sau' vào mỗi movie card. Lưu danh sách vào localStorage/IndexedDB. Hiển thị trang Watchlist riêng, hỗ trợ sort theo ngày thêm và tên.", "alignmentScore": 0.91},
+            {"id": "prod-categories", "title": "Thể loại và lọc phim", "task": "Thêm navigation theo thể loại (Hành động, Hài, Kinh dị, ...). Filter bar trên catalog: genre, year range, rating min. URL-driven filter state (query params).", "alignmentScore": 0.88},
+            {"id": "prod-continue", "title": "Tiếp tục xem / lịch sử", "task": "Lưu tiến độ xem (phút:giây) vào localStorage. Hiển thị 'Tiếp tục xem' section trên trang chủ. Khi quay lại phim → resume từ vị trí đã lưu.", "alignmentScore": 0.86},
+            {"id": "prod-test", "title": "Tests cho các component hiện có", "task": "Viết unit test và integration test cho các component đã có (movie card, player, search, watchlist). Target 70%+ coverage. Dùng Vitest/Jest + Testing Library.", "alignmentScore": 0.82},
+        ],
+        "ecommerce": [
+            {"id": "prod-catalog", "title": "Product catalog grid", "task": "Xây dựng grid sản phẩm với ảnh, giá, rating. Hỗ trợ sort (giá, tên, mới nhất) và filter (category, price range). Responsive 2/3/4 columns.", "alignmentScore": 0.94},
+            {"id": "prod-cart", "title": "Shopping cart + checkout flow", "task": "Thêm giỏ hàng (add/remove/update quantity). Tính tổng tiền. Checkout form với validation. Lưu cart state vào localStorage.", "alignmentScore": 0.92},
+        ],
+        "dashboard": [
+            {"id": "prod-charts", "title": "Data visualization charts", "task": "Thêm chart components (line, bar, pie) hiển thị dữ liệu. Responsive resize. Loading skeleton. Empty state khi chưa có dữ liệu.", "alignmentScore": 0.93},
+            {"id": "prod-filters", "title": "Filter + date-range controls", "task": "Thêm filter controls: date-range picker, dropdown filters, search input. URL-driven state. Debounced fetch.", "alignmentScore": 0.90},
+        ],
+        "blog": [
+            {"id": "prod-post", "title": "Blog post page with markdown", "task": "Xây dựng trang bài viết: markdown render, syntax highlight, table of contents, breadcrumb. Responsive typography.", "alignmentScore": 0.93},
+            {"id": "prod-list", "title": "Blog post list with pagination", "task": "Danh sách bài viết: card grid, pagination/infinite scroll, category filter, search. Loading skeleton.", "alignmentScore": 0.91},
+        ],
+    }
+    defaults = [
+        {"id": "prod-feature", "title": "Core user feature from goal", "task": f"Từ mục tiêu sản phẩm '{goal[:120]}', phân tích code hiện tại và xây dựng hoặc cải thiện một tính năng cốt lõi mà người dùng sẽ tương tác trực tiếp. Ưu tiên tính năng có UI visible. Viết test và verify trong browser.", "alignmentScore": 0.80},
+        {"id": "prod-fix", "title": "Fix regression từ lần thay đổi trước", "task": f"Kiểm tra code đã sửa trong session này liên quan đến '{goal[:100]}'. Chạy test suite, phát hiện test fail hoặc regression, fix từng cái một. Không thêm tính năng mới.", "alignmentScore": 0.75},
+    ]
+    pool = templates.get(product_type, defaults)
+    return pool if len(pool) >= 3 else pool + defaults
+
+
+def _build_generic_pool(
+    goal: str,
+    report: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Capability-builder templates for any product type."""
+    return [
+        {"id": "prod-ui-core", "title": "Xây dựng UI chính của sản phẩm", "task": f"Từ mục tiêu '{goal[:120]}', phân tích code hiện tại. Xác định UI chính mà người dùng sẽ thấy đầu tiên. Xây dựng hoặc cải thiện UI đó: layout, component, responsive. Viết test verify.", "alignmentScore": 0.85},
+        {"id": "prod-feature-gap", "title": "Lấp khoảng trống tính năng", "task": f"Khảo sát code hiện tại trong workspace. So sánh với mục tiêu '{goal[:100]}'. Tìm một tính năng còn thiếu hoặc chưa hoàn thiện. Implement nó. Test.", "alignmentScore": 0.82},
+        {"id": "prod-bug-fix", "title": "Sửa lỗi hiển thị / UX", "task": f"Chạy ứng dụng trong browser. Ghi nhận mọi lỗi hiển thị, broken link, layout xấu, console error trong workspace '{goal[:80]}'. Fix từng cái. Verify sau khi fix.", "alignmentScore": 0.78},
+        {"id": "prod-test-gap", "title": "Test gap coverage", "task": "Kiểm tra test coverage của các component chính. Viết test cho component chưa có test. Target mỗi component có ít nhất 1 unit test + 1 interaction test.", "alignmentScore": 0.76},
+        {"id": "prod-perf", "title": "Performance & loading optimization", "task": "Kiểm tra loading time, image optimization, code splitting. Thêm loading skeletons, lazy load images, optimize bundle. Đo Lighthouse score trước và sau.", "alignmentScore": 0.72},
+        {"id": "prod-a11y", "title": "Accessibility audit", "task": "Kiểm tra keyboard navigation, screen reader, color contrast, focus management. Sửa các vấn đề accessibility cơ bản (alt text, aria labels, focus order).", "alignmentScore": 0.70},
+    ]
+
+
+STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "through", "during",
+    "before", "after", "above", "below", "between", "and", "but", "or",
+    "nor", "not", "so", "yet", "both", "either", "neither", "each",
+    "every", "all", "any", "few", "more", "most", "other", "some", "such",
+    "only", "own", "same", "than", "too", "very", "just", "about", "also",
+    "và", "của", "một", "tôi", "cho", "có", "không", "được", "này",
+    "những", "các", "để", "là", "trong", "khi", "hoặc",
+}
+
+
 def select_next_task(
     report: dict[str, Any] | None,
     completed_ids: set[str] | None = None,
     *,
     idea_cursor: int = 0,
+    product_goal: str | None = None,
 ) -> dict[str, Any] | None:
-    """Pick the single highest-priority task from an autonomy report.
+    """Pick the single highest-priority task aligned with product_goal.
 
     Order:
-      1. Findings sorted by (_CATEGORY_ORDER, -priorityScore).
-      2. Rotating enhancement-idea pool (so the loop never starves).
-
-    Returns {id, category, title, task, source, priorityScore} or None
-    when the report is empty AND the idea pool is exhausted for this cursor.
+      1. Product-aligned findings (workspace scan filtered by goal similarity).
+      2. Product-aligned enhancement ideas (template-based for detected product type).
+      3. PLATFORM_MAINTENANCE pool — only when product_goal is empty or
+         the workspace IS the agent engine itself.
     """
     completed_ids = completed_ids or set()
     findings = list((report or {}).get("findings") or [])
+    goal = (product_goal or "").strip()
+    workspace_is_agent_engine = _detect_agent_engine_workspace(report)
 
     def _sort_key(item: dict[str, Any]) -> tuple[int, float]:
         cat = str(item.get("category") or "")
         cat_rank = _CATEGORY_ORDER.get(cat, 10)
-        # higher priorityScore wins inside the same category → negate.
         return (cat_rank, -float(item.get("priorityScore") or 0.0))
 
-    for finding in sorted(findings, key=_sort_key):
-        fid = str(finding.get("id") or "")
-        if not fid or fid in completed_ids:
-            continue
-        return {
-            "id": fid,
-            "kind": "finding",
-            "category": finding.get("category"),
-            "title": finding.get("title"),
-            "source": finding.get("source"),
-            "priorityScore": finding.get("priorityScore"),
-            "task": _format_finding_task(finding),
-        }
+    # Priority 1: product-aligned workspace findings
+    if goal:
+        for finding in sorted(findings, key=_sort_key):
+            fid = str(finding.get("id") or "")
+            if not fid or fid in completed_ids:
+                continue
+            alignment = _compute_goal_alignment(goal, finding)
+            if alignment >= 0.70:
+                return {
+                    "id": fid,
+                    "kind": "product_finding",
+                    "category": finding.get("category"),
+                    "title": finding.get("title"),
+                    "source": finding.get("source"),
+                    "priorityScore": finding.get("priorityScore"),
+                    "alignmentScore": round(alignment, 3),
+                    "task": _format_finding_task(finding),
+                }
 
-    pool_size = len(_ENHANCEMENT_IDEAS)
-    if pool_size == 0:
-        return None
-    for offset in range(pool_size):
-        idea = _ENHANCEMENT_IDEAS[(idea_cursor + offset) % pool_size]
-        if idea["id"] in completed_ids:
-            continue
-        return {
-            "id": idea["id"],
-            "kind": "enhancement_idea",
-            "category": idea["category"],
-            "title": idea["title"],
-            "source": "autonomy.enhancement_pool",
-            "priorityScore": None,
-            "task": idea["task"],
-        }
+    # Priority 2: product-aligned enhancement ideas
+    if goal:
+        ideas = _build_product_enhancement_pool(goal, report)
+        pool_size = len(ideas)
+        if pool_size > 0:
+            for offset in range(pool_size):
+                idea = ideas[(idea_cursor + offset) % pool_size]
+                if idea["id"] in completed_ids:
+                    continue
+                return {
+                    **idea,
+                    "kind": "product_enhancement",
+                    "alignmentScore": round(float(idea.get("alignmentScore") or 0.95), 3),
+                }
+
+    # Priority 3: PLATFORM_MAINTENANCE — only when no product_goal or the
+    # workspace IS the agent engine itself
+    if workspace_is_agent_engine or not goal:
+        for finding in sorted(findings, key=_sort_key):
+            fid = str(finding.get("id") or "")
+            if not fid or fid in completed_ids:
+                continue
+            return {
+                "id": fid,
+                "kind": "finding",
+                "category": finding.get("category"),
+                "title": finding.get("title"),
+                "source": finding.get("source"),
+                "priorityScore": finding.get("priorityScore"),
+                "task": _format_finding_task(finding),
+            }
+        pool_size = len(_ENHANCEMENT_IDEAS)
+        if pool_size > 0:
+            for offset in range(pool_size):
+                idea = _ENHANCEMENT_IDEAS[(idea_cursor + offset) % pool_size]
+                if idea["id"] in completed_ids:
+                    continue
+                return {
+                    "id": idea["id"],
+                    "kind": "enhancement_idea",
+                    "category": idea["category"],
+                    "title": idea["title"],
+                    "source": "autonomy.enhancement_pool",
+                    "priorityScore": None,
+                    "task": idea["task"],
+                }
+
     return None
 
 

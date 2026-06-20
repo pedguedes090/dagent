@@ -986,11 +986,13 @@ async function autoLoopTick() {
 
   try {
     const rescanIfStale = state.autoLoop.iterations === 0 || (state.autoLoop.iterations % 5 === 0);
+    const productGoal = state.activeSession?.productGoal || state.activeTask || "";
     const reply = await appApi.requestAutonomyNextTask({
       workspacePath: workspace,
       completedIds: state.autoLoop.completedIds,
       ideaCursor: state.autoLoop.ideaCursor,
-      rescanIfStale
+      rescanIfStale,
+      productGoal
     });
     if (!reply?.task) {
       autoLoopLog("Không còn finding/ý tưởng nào — chờ scan mới.", "info");
@@ -1084,6 +1086,11 @@ function autoLoopSetEnabled(enabled) {
 }
 
 function renderAutoLoop() {
+  // Show product goal so user can verify Auto Loop stays on track.
+  const pg = state.activeSession?.productGoal || state.activeTask || "";
+  if (E.autoLoopStatus && pg && !E.autoLoopStatus.dataset.goalShown) {
+    E.autoLoopStatus.dataset.goalShown = "1";
+  }
   const statusEl = E.autoLoopStatus;
   const btn = E.autoLoopToggleBtn;
   const logEl = E.autoLoopLog;
@@ -1092,15 +1099,17 @@ function renderAutoLoop() {
     btn.classList.toggle("active", state.autoLoop.enabled);
   }
   if (statusEl) {
+    const goalLine = pg ? `🎯 ${pg.slice(0, 80)}${pg.length > 80 ? "…" : ""} · ` : "";
     if (!state.autoLoop.enabled) {
-      statusEl.textContent = `Tắt — đã chạy ${state.autoLoop.iterations} iteration${state.autoLoop.iterations === 1 ? "" : "s"} trước đó.`;
+      statusEl.textContent = `${goalLine}Tắt — đã chạy ${state.autoLoop.iterations} iteration${state.autoLoop.iterations === 1 ? "" : "s"} trước đó.`;
     } else if (state.running) {
-      statusEl.textContent = `Đang chạy iteration #${state.autoLoop.iterations} · ${state.autoLoop.lastTask?.title || state.autoLoop.lastTask?.id || "task"}`;
+      const taskTitle = state.autoLoop.lastTask?.title || state.activeTask?.slice(0, 60) || "task";
+      statusEl.textContent = `${goalLine}Đang chạy: ${taskTitle}`;
     } else if (state.autoLoop.nextAttemptAt) {
       const ms = Math.max(0, state.autoLoop.nextAttemptAt - Date.now());
-      statusEl.textContent = `Chờ iteration kế tiếp (~${Math.ceil(ms / 1000)}s) · đã hoàn tất ${state.autoLoop.iterations}.`;
+      statusEl.textContent = `${goalLine}Chờ ~${Math.ceil(ms / 1000)}s · ${state.autoLoop.iterations} hoàn tất`;
     } else {
-      statusEl.textContent = `Đang chọn task… · đã hoàn tất ${state.autoLoop.iterations}.`;
+      statusEl.textContent = `${goalLine}Đang chọn task… · ${state.autoLoop.iterations} hoàn tất`;
     }
   }
   if (logEl) {

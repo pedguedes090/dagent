@@ -218,7 +218,12 @@ class AgentBackendService {
             "model", "tool", "status",
             "durationMs", "retryCount", "reviewCycle",
             "tokenUsage", "inputSummary", "outputSummary",
-            "warnings", "error", "routeLabel"
+            "warnings", "error", "routeLabel",
+            // Agent I/O Inspector fields (keep in sync with server.py ALLOWED)
+            "promptTemplate", "input", "output", "outputDelta",
+            "toolInput", "toolResult", "changedFiles",
+            "evidence", "blockers", "confidence",
+            "sequence", "issueCount", "passed"
           ];
           for (const key of ENRICHED) {
             if (message[key] !== undefined && message[key] !== null) {

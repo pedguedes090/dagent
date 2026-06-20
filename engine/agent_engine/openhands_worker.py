@@ -568,13 +568,22 @@ def run_openhands_worker(
 
     def on_event(event: Any) -> None:
         stage, detail = _event_summary(event)
+        event_name = event.__class__.__name__
+        tool_name = str(getattr(event, "tool_name", "") or "")
+        tool_input = _safe_model_dump(getattr(event, "action", getattr(event, "tool_call", None)))
+        tool_error = None
+        if event_name == "ObservationEvent":
+            obs = getattr(event, "observation", None)
+            if obs and getattr(obs, "error", None):
+                tool_error = str(obs.error)[:500]
         record_checkpoint(
             "openhands_event",
             event.__class__.__name__,
             {
                 "stage": stage,
                 "detail": detail,
-                "toolName": str(getattr(event, "tool_name", "") or ""),
+                "toolName": tool_name,
+                "toolInput": tool_input,
                 "event": _safe_model_dump(event),
             },
         )
@@ -589,6 +598,18 @@ def run_openhands_worker(
             pass
         events.append(f"{stage}: {detail}")
         emit(stage, detail)
+        # Emit tool_call event for ActionEvent + ObservationEvent so the UI
+        # Agent Inspector Tools subtab has real data to render.
+        if tool_name and event_name in ("ActionEvent", "ObservationEvent"):
+            emit(
+                stage,
+                detail,
+                event_type="tool_call",
+                tool=tool_name,
+                tool_input=_compact_text(tool_input or {}, 400) if tool_input else None,
+                status="error" if tool_error else "ok",
+                error=tool_error,
+            )
 
     openhands_model = model
     if server_url and not model.startswith(("openai/", "azure/", "anthropic/", "gemini/", "ollama/", "openrouter/")):

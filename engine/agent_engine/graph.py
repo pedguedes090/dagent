@@ -1959,6 +1959,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             retry_count = int(state.get("retryCount", 0) or 0)
             review_cycle = int(state.get("reviewCycle", 0) or 0)
             input_keys = list(context_routes.get(node_name, []) or [])
+            if not input_keys:
+                # Fallback: always surface task, problem, workspacePath so every
+                # node's I/O subtab shows real data even when contextRoutes has
+                # no explicit entry for this node.
+                input_keys = ["task", "taskIntent", "problem", "workspacePath", "executionId"]
             input_summary = _summarize_state(state, input_keys) if input_keys else ""
             if is_cancelled(execution_id):
                 emit(
@@ -1986,7 +1991,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 status="running",
                 retry_count=retry_count,
                 review_cycle=review_cycle,
-                input_summary=input_summary or None,
+                input_summary=input_summary,
             )
             step_input = {
                 "node": node_name,
@@ -2026,7 +2031,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                         raise
                     durable_step.set_output(output)
                     duration_ms = (telemetry.now_ms() - t0) if t0 is not None and hasattr(telemetry, "now_ms") else None
-                    output_summary = _summarize_value(output) if isinstance(output, (dict, list)) else None
+                    output_summary = _summarize_value(output)
                     try:
                         token_delta = telemetry.get_token_usage_delta() if hasattr(telemetry, "get_token_usage_delta") else None
                     except Exception:

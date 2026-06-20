@@ -40,6 +40,24 @@ class AppDatabase {
   }
 
   migrate() {
+    this._migrateV5_1_ProductGoal();
+  }
+
+  _migrateV5_1_ProductGoal() {
+    // Add product_goal column to sessions if it doesn't exist yet.
+    // SQLite ALTER TABLE with ADD COLUMN is idempotent — it fails
+    // with "duplicate column name" on subsequent calls, which we ignore.
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN product_goal TEXT NOT NULL DEFAULT ''");
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e && e.message || ""))) throw e;
+    }
+  }
+
+  /** @deprecated — actual migration happens in _migrateV5_1_ProductGoal; this
+   *  block is the original CREATE TABLE IF NOT EXISTS set that bootstraps the
+   *  database on first launch. Keep it clean. */
+  _legacyMigrate() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS app_state (
         key TEXT PRIMARY KEY,

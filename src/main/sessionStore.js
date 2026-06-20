@@ -117,21 +117,22 @@ class SessionStore {
       id: crypto.randomUUID(),
       title: makeTitle(initial.title),
       workspacePath: initial.workspacePath || "",
+      productGoal: String(initial.productGoal || ""),
       messages: [],
       runs: [],
       createdAt: timestamp,
       updatedAt: timestamp
     };
     this.database.db
-      .prepare("INSERT INTO sessions (id, title, workspace_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
-      .run(session.id, session.title, session.workspacePath, session.createdAt, session.updatedAt);
+      .prepare("INSERT INTO sessions (id, title, workspace_path, product_goal, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(session.id, session.title, session.workspacePath, session.productGoal, session.createdAt, session.updatedAt);
     this.database.setAppState("activeSessionId", session.id);
     return session;
   }
 
   get(sessionId) {
     const row = this.database.db
-      .prepare("SELECT id, title, workspace_path, created_at, updated_at FROM sessions WHERE id = ?")
+      .prepare("SELECT id, title, workspace_path, product_goal, created_at, updated_at FROM sessions WHERE id = ?")
       .get(sessionId);
     if (!row) return null;
     const messages = this.database.db
@@ -154,6 +155,7 @@ class SessionStore {
       id: row.id,
       title: row.title,
       workspacePath: row.workspace_path || "",
+      productGoal: row.product_goal || "",
       messages,
       runs,
       createdAt: row.created_at,
@@ -173,10 +175,10 @@ class SessionStore {
     this.database.transaction(() => {
       this.database.db
         .prepare(
-          "INSERT INTO sessions (id, title, workspace_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?) " +
-            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, workspace_path = excluded.workspace_path, updated_at = excluded.updated_at"
+          "INSERT INTO sessions (id, title, workspace_path, product_goal, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(id) DO UPDATE SET title = excluded.title, workspace_path = excluded.workspace_path, product_goal = excluded.product_goal, updated_at = excluded.updated_at"
         )
-        .run(nextSession.id, nextSession.title, nextSession.workspacePath || "", nextSession.createdAt || nowIso(), nextSession.updatedAt);
+        .run(nextSession.id, nextSession.title, nextSession.workspacePath || "", nextSession.productGoal || "", nextSession.createdAt || nowIso(), nextSession.updatedAt);
 
       this.database.db.prepare("DELETE FROM messages WHERE session_id = ?").run(nextSession.id);
       const insertMessage = this.database.db.prepare(
