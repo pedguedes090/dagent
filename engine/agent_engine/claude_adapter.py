@@ -609,21 +609,43 @@ class ClaudeProvider:
             assistant_content = response.content[:]
 
             # Execute tools and build result blocks
+            import time as _time
             for tc in response.tool_calls:
+                t0_tool = int(_time.perf_counter() * 1000)
                 try:
                     result_text = tool_executor(tc)
-                    assistant_content.append({
-                        "type": "tool_result",
-                        "tool_use_id": tc.id,
-                        "content": result_text,
-                    })
+                    status = "ok"
+                    error = None
                 except Exception as exc:
-                    assistant_content.append({
-                        "type": "tool_result",
-                        "tool_use_id": tc.id,
-                        "content": f"Error executing tool {tc.name}: {exc}",
-                        "is_error": True,
-                    })
+                    result_text = f"Error executing tool {tc.name}: {exc}"
+                    status = "error"
+                    error = str(exc)
+                duration = int(_time.perf_counter() * 1000) - t0_tool
+                def _trunc(t: Any, n: int) -> str:
+                    s = str(t)
+                    return s[:n] + "…" if len(s) > n else s
+                assistant_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": result_text,
+                    **(error and {"is_error": True} or {}),
+                })
+                # Emit tool_call event if caller provided emit callback
+                if emit is not None:
+                    try:
+                        emit(
+                            f"tool_{tc.name}",
+                            _trunc(result_text, 300),
+                            event_type="tool_call",
+                            tool=str(tc.name),
+                            status=status,
+                            duration_ms=duration,
+                            tool_input=_trunc(getattr(tc, "input", ""), 400),
+                            tool_result=_trunc(result_text, 400),
+                            error=error,
+                        )
+                    except Exception:
+                        pass
 
             conv.append(ClaudeMessage(role="assistant", content=assistant_content))
             write_debug_event("claude.tool_round", {

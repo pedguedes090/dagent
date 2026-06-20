@@ -212,32 +212,53 @@ def _scan_file(root: Path, path: Path) -> list[dict[str, Any]]:
 
 def _scan_missing_tests(workspace: str | Path) -> list[dict[str, Any]]:
     root = Path(workspace).resolve()
-    engine_dir = root / "engine" / "agent_engine"
-    tests_dir = root / "tests"
-    if not engine_dir.exists() or not tests_dir.exists():
+    # Discover source directories containing Python modules — check top-level
+    # dirs AND one level deeper (common patterns: src/, engine/, lib/).
+    candidate_dirs: list[Path] = []
+    try:
+        for entry in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not entry.is_dir() or entry.name in AUTONOMY_IGNORE_DIRS:
+                continue
+            if list(entry.glob("*.py")):
+                candidate_dirs.append(entry)
+            # Also check one level deeper (e.g. engine/agent_engine/)
+            try:
+                for sub in sorted(entry.iterdir(), key=lambda p: p.name.lower()):
+                    if sub.is_dir() and sub.name not in AUTONOMY_IGNORE_DIRS:
+                        if list(sub.glob("*.py")):
+                            candidate_dirs.append(sub)
+            except OSError:
+                continue
+    except OSError:
         return []
-    existing_tests = {item.name for item in tests_dir.glob("test_*.py")}
+    if not candidate_dirs:
+        return []
     findings: list[dict[str, Any]] = []
-    for module in sorted(engine_dir.glob("*.py"), key=lambda item: item.name):
-        if module.name == "__init__.py":
-            continue
-        expected = f"test_{module.stem}.py"
-        if expected in existing_tests:
-            continue
-        findings.append(
-            _base_finding(
-                category="test_coverage",
-                title="Missing focused test module",
-                severity="medium",
-                confidence=0.7,
-                impact=2.2,
-                effort=2.0,
-                source=relpath(module, root),
-                evidence=f"No tests/{expected} found for {relpath(module, root)}.",
-                recommendation="Add focused unit tests or explicitly document why coverage is exercised elsewhere.",
-                tags=["verification", "coverage_gap"],
+    tests_dir = root / "tests"
+    existing_tests: set[str] = set()
+    if tests_dir.exists():
+        existing_tests = {item.name for item in tests_dir.glob("test_*.py")}
+    for src_dir in candidate_dirs:
+        for module in sorted(src_dir.glob("*.py"), key=lambda item: item.name):
+            if module.name == "__init__.py":
+                continue
+            expected = f"test_{module.stem}.py"
+            if expected in existing_tests:
+                continue
+            findings.append(
+                _base_finding(
+                    category="test_coverage",
+                    title="Missing focused test module",
+                    severity="medium",
+                    confidence=0.7,
+                    impact=2.2,
+                    effort=2.0,
+                    source=relpath(module, root),
+                    evidence=f"No tests/{expected} found for {relpath(module, root)}.",
+                    recommendation="Add focused unit tests or explicitly document why coverage is exercised elsewhere.",
+                    tags=["verification", "coverage_gap"],
+                )
             )
-        )
     return findings[:12]
 
 
