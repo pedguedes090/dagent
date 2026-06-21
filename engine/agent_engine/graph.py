@@ -1671,16 +1671,36 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     chunk = allowed_all[i * chunk_sz : (i + 1) * chunk_sz if i < n - 1 else len(allowed_all)]
                     if not chunk:
                         continue
-                    _workq.put({"idx": i, "label": f"file-partition-{i + 1}",
-                                "prompt_extra": f"Only edit: {', '.join(chunk[:10])}",
+                    _workq.put({"idx": i, "label": f"file-{i + 1}",
+                                "prompt_extra": f"ONLY edit these files: {', '.join(chunk[:10])}",
                                 "allowedFiles": chunk,
                                 "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
             if _workq.empty():
-                for i in range(n):
-                    _workq.put({"idx": i, "label": f"scope-{i + 1}",
-                                "prompt_extra": f"Worker {i + 1}/{n}: implement a different slice.",
-                                "allowedFiles": allowed_all,
-                                "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
+                # Partition by existing workspace files so agents work disjoint.
+                try:
+                    from .workspace import walk_workspace
+                    existing = [f["path"] for f in walk_workspace(shared_workspace, max_files=200, max_depth=5)
+                                if f.get("path", "").endswith((".py",".ts",".tsx",".js",".jsx",".vue",".css",".html"))]
+                    # Exclude generated/vendor paths.
+                    existing = [p for p in existing if not any(p.startswith(d) for d in (".git/","node_modules/","dist/","build/","out/","__pycache__/",".venv/",".agent-state/",".codegraph/",".pytest_cache/"))]
+                    if existing and len(existing) >= n:
+                        chunk_sz = max(1, len(existing) // n)
+                        for i in range(n):
+                            chunk = existing[i * chunk_sz : (i + 1) * chunk_sz if i < n - 1 else len(existing)]
+                            if not chunk:
+                                continue
+                            _workq.put({"idx": i, "label": f"files-{i + 1}",
+                                        "prompt_extra": f"ONLY edit these files: {', '.join(chunk[:12])}",
+                                        "allowedFiles": chunk,
+                                        "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
+                except Exception:
+                    pass
+            if _workq.empty():
+                # Greenfield or tiny project — 1 focused worker beats N fighting.
+                _workq.put({"idx": 0, "label": "creator",
+                            "prompt_extra": "Create the full project from scratch. Greenfield build.",
+                            "allowedFiles": allowed_all,
+                            "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
 
         total_items = _workq.qsize()
         emit("openhands_worker", f"⚡ FULL THROTTLE: {total_items} items, {max_workers} concurrent coders + work-stealing")
@@ -1717,15 +1737,15 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 scoped_spec["forbiddenPaths"] = item.get("forbiddenPaths") or []
                 if item.get("prompt_extra"):
                     scoped_spec["subtaskBrief"] = item["prompt_extra"]
-                # Inject A2A bus context so the agent knows what other agents already did.
-                try:
-                    scoped_spec["fleetContext"] = {
-                        "totalItems": total_items,
-                        "claimedFiles": sorted(_claimed_files),
-                        "peerResults": len(worker_results),
-                    }
-                except Exception:
-                    pass
+                scoped_spec["fleetContext"] = {
+                    "totalItems": total_items,
+                    "claimedFiles": sorted(_claimed_files),
+                    "peerResults": len(worker_results),
+                }
+                # Emit fleet status so the UI Stream tab shows live per-agent action.
+                emit("openhands_worker", f"⚡ started [{label}]", node="openhands_worker",
+                     agent_role="coder", status="running",
+                     input=f"FLEET: {len(worker_results)}/{total_items} done, starting {label}")
                 wr: dict[str, Any] = {}
                 try:
                     wr = run_claude_code_worker(
@@ -1744,22 +1764,24 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     )
                     wr["subtaskLabel"] = label
                     wr["subtaskIdx"] = idx
-                    # Broadcast to fleet: these files are now done.
-                    try:
-                        changed = [f.get("path") or "" for f in (wr.get("changedFiles") or [])]
-                        if changed:
+                    changed = [f.get("path") or "" for f in (wr.get("changedFiles") or [])]
+                    if changed:
+                        try:
                             bus.publish(
                                 A2AMessage(role="agent", parts=[TextPart(text=f"done: {', '.join(changed[:8])}")],
                                         contextId=execution_id, taskId=label),
                                 topic=bus_topic, sender_agent_id=f"coder-{label}",
                             )
-                    except Exception:
-                        pass
-                    emit("openhands_worker", f"[{label}] ✓ hoàn tất · {len(wr.get('changedFiles') or [])} file changed")
+                        except Exception:
+                            pass
+                    emit("openhands_worker", f"✓ [{label}] hoàn tất · {len(changed)} file",
+                         node="openhands_worker", agent_role="coder", status="completed",
+                         output=f"{len(changed)} files changed")
                 except Exception as exc:
                     wr = {"error": str(exc), "summary": f"{label} crashed: {exc}", "changedFiles": [],
                           "subtaskLabel": label, "subtaskIdx": idx}
-                    emit("openhands_worker", f"[{label}] ✗ crash: {exc}")
+                    emit("openhands_worker", f"✗ [{label}] crash", node="openhands_worker",
+                         agent_role="coder", status="error", error=str(exc)[:500])
                 with _res_lock:
                     worker_results.append(wr)
                 _workq.task_done()
