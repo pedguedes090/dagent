@@ -1713,12 +1713,16 @@ function setupTabs() {
       contents.forEach(c => c.classList.toggle("active", c.id === `tab-${name}`));
       if (name === "log") renderLogTab();
       if (name === "swarm" && window.THREE && window.Swarm3DMap) {
+        // Container has 0 size when tab is hidden — wait for display:block then init.
         setTimeout(() => {
           const c = document.getElementById("swarm3dContainer");
-          if (c && !window._swarm3d) {
+          if (!c || c.clientWidth === 0) return;
+          if (!window._swarm3d) {
             window._swarm3d = new window.Swarm3DMap(c);
+            // Force resize after tab fully visible.
+            setTimeout(() => { if (window._swarm3d) window._swarm3d._onResize(); }, 150);
           }
-        }, 50);
+        }, 200);
       }
       if (name === "review") {
         const activeSubtab = document.querySelector(".review-subtabs .subtab.active")?.dataset.subtab || "code";
