@@ -54,6 +54,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "real_sqlite: opt out of InMemorySaver — use a real SQLite checkpointer (slow, writes WAL).",
     )
     os.environ.setdefault("AGENT_TEST_INMEM", "1")
+    # Doctor scanner now runs the stack's check commands (pytest/tsc) to detect
+    # real failures. Disable that inside the test suite so a doctor unit test
+    # cannot recursively invoke pytest on this repo.
+    os.environ.setdefault("AGENT_DOCTOR_RUN_CHECKS", "0")
     # Quieter test boot — saves ~1-2s/process printing the OpenHands banner.
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
     # Redirect every tempfile.* call to the in-repo root so cleanup is local.

@@ -111,7 +111,7 @@ class DurableExecutionTests(unittest.TestCase):
                 "executionId": "exec-resume",
                 "correlationId": "cid-resume",
                 "sessionId": "session-1",
-                "content": "task",
+                "content": "đọc file config và giải thích",
                 "workspacePath": temp_dir,
                 "settings": {"serverUrl": "http://model.test/v1", "model": "test", "apiKey": "secret"},
                 "messages": [],

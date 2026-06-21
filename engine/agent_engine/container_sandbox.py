@@ -69,6 +69,14 @@ def infer_stack_from_command(command: str, fallback: str = "generic") -> str:
 
 
 def container_status(stack: str = "generic") -> dict[str, Any]:
+    if str(os.getenv("AGENT_DISABLE_CONTAINER") or "").lower() in {"1", "true", "yes", "on"}:
+        return {
+            "ready": False,
+            "runtime": None,
+            "image": image_for_stack(stack),
+            "disabled": True,
+            "reason": "Container sandbox disabled by AGENT_DISABLE_CONTAINER; workflow may use its explicit policy-limited host lane.",
+        }
     runtime = detect_container_runtime()
     image = image_for_stack(stack)
     if not runtime:

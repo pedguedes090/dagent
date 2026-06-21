@@ -495,102 +495,164 @@ def run_idle_discovery(workspace: str | Path, state_dir: str | Path, *, limit: i
 
 # ── Autonomous loop: pick a single task from the report ───────────────────
 
-# Priority order across categories. Critical/security blockers first, then
-# verification gaps, then maintainability, then debt cleanup, then enhancement
-# ideas from the rotating pool.
+# Priority order across categories for PLATFORM_MAINTENANCE fallback only —
+# used when no product goal is set OR the workspace IS the agent engine itself.
+
+# ── ANTI-HALT: patterns LLM workers/councils must never emit ───────────────────────────────────
+
+_CLARIFICATION_PATTERNS = (
+    (re.compile(r"Cần\s+làm\s+rõ", re.IGNORECASE), "vn_clarify"),
+    (re.compile(r"Chọn\s+\d+\s+hoặc\s+\d+", re.IGNORECASE), "vn_choose"),
+    (re.compile(r"Xác\s+nhận\s+trước", re.IGNORECASE), "vn_confirm"),
+    (re.compile(r"Halt", re.IGNORECASE), "halt"),
+    (re.compile(r"chờ\s+câu\s+trả\s+lời", re.IGNORECASE), "vn_wait_answer"),
+    (re.compile(r"chờ\s+xác\s+nhận", re.IGNORECASE), "vn_wait_confirm"),
+    (re.compile(r"Workspace\s+không\s+liên\s+quan", re.IGNORECASE), "vn_irrelevant_ws"),
+    (re.compile(r"You should (not|never|avoid)\s+\w+ing\s+this\s+in", re.IGNORECASE), "en_discourage"),
+    (re.compile(r"Please\s+(confirm|choose|select|pick|decide)\b", re.IGNORECASE), "en_please_decide"),
+    (re.compile(r"clarifying\s+question", re.IGNORECASE), "en_clarify"),
+    (re.compile(r"Before\s+I\s+(proceed|start|begin|continue|edit)", re.IGNORECASE), "en_before_gate"),
+    (re.compile(r"Do you want me to", re.IGNORECASE), "en_do_you_want"),
+    (re.compile(r"I (need|require) (you|the user) to", re.IGNORECASE), "en_need_user"),
+    (re.compile(r"What (stack|theme|framework|library|database|backend|frontend|approach|architecture|scope|feature)", re.IGNORECASE), "en_what_choice"),
+    (re.compile(r"Should I (use|pick|choose|build|create|scaffold|install|add)\b", re.IGNORECASE), "en_should_i"),
+    (re.compile(r"Which (one|approach|option|way|pattern|strategy|method)", re.IGNORECASE), "en_which"),
+    (re.compile(r"\?\s*$", re.MULTILINE), "question_mark_eol"),
+)
+
+_CLARIFICATION_ANSWERS = {
+    "vn_clarify": "Autonomous mode: không cần làm rõ. Dùng default decision policy.",
+    "vn_choose": "Autonomous mode: tự chọn option 1 làm default, record assumption.",
+    "vn_confirm": "Autonomous mode: bỏ qua xác nhận. Giả sử approved.",
+    "halt": "Autonomous mode: bỏ qua halt. Tiếp tục.",
+    "vn_wait_answer": "Autonomous mode: không chờ. Tiến hành với default.",
+    "vn_wait_confirm": "Autonomous mode: không chờ xác nhận. Proceed.",
+    "vn_irrelevant_ws": "Autonomous mode: tạo project mới trong music-app/.",
+    "en_discourage": "Autonomous mode: proceed regardless.",
+    "en_please_decide": "Autonomous mode: auto-decide — use the first option.",
+    "en_clarify": "Autonomous mode: no clarification needed. Use defaults.",
+    "en_before_gate": "Autonomous mode: no gate. Proceed immediately.",
+    "en_do_you_want": "Autonomous mode: yes, proceed. Default action.",
+    "en_need_user": "Autonomous mode: user unavailable. Self-serve.",
+    "en_what_choice": "Autonomous mode: default stack = Vite+React+TS+CSS modules.",
+    "en_should_i": "Autonomous mode: yes, proceed with the most standard choice.",
+    "en_which": "Autonomous mode: first option.",
+    "question_mark_eol": "Autonomous mode: rhetorical question. Self-answer and proceed.",
+}
+
+
+def detect_clarification_halt(text: str) -> list[dict[str, str]]:
+    if not text:
+        return []
+    hits: list[dict[str, str]] = []
+    for pattern, tag in _CLARIFICATION_PATTERNS:
+        for match in pattern.finditer(text):
+            hits.append({
+                "tag": tag,
+                "matched": match.group(0)[:120],
+                "answer": _CLARIFICATION_ANSWERS.get(tag, "Autonomous mode: ignore and proceed."),
+            })
+    return hits
+
+
+def is_valid_worker_response(output: str) -> tuple[bool, list[dict[str, str]]]:
+    hits = detect_clarification_halt(output)
+    return (len(hits) == 0, hits)
+
+
+_AUTONOMOUS_BOOTSTRAP_TASK_TEMPLATE = """AUTONOMOUS PRODUCT ITERATION — MUTATION_REQUIRED=true
+
+Original goal: {goal}
+Product root: {product_root}
+Selected capability: product_foundation
+Assumptions: {assumptions}
+Acceptance criteria:
+  - App launches and renders a usable interface.
+  - No console errors, no blank screen.
+  - Core interaction works (click something, see result).
+Verification plan:
+  - Run build or typecheck.
+  - Open in browser.
+  - Click through at least one user flow.
+  - Verify no fatal errors.
+
+FULL WRITE ACCESS to productRoot. You MUST edit files. You MUST run commands. You MUST verify with browser.
+Do NOT produce a plan/report. Produce working code changes.
+Bạn được quyền tự quyết và triển khai trong productRoot.
+Không hỏi người dùng. Giới hạn mọi thay đổi trong productRoot; agent platform nằm ngoài phạm vi.
+Phải tạo thay đổi hoạt động được và browser-verify.
+Tự chọn stack mặc định: Vite + React + TypeScript + CSS variables.
+Tự tạo project nếu chưa có.
+Tự cài dependencies.
+Tự khởi chạy dev server và mở browser kiểm tra."""
+
+
+_DEFAULT_ASSUMPTIONS = "Vite+React+TS, CSS variables, dark minimal UI, localStorage persistence, HTMLAudioElement for music, no backend required"
+
+
+def _bootstrap_project_dir(goal: str) -> str:
+    value = str(goal or "").lower()
+    categories = (
+        (("nhạc", "music", "audio", "spotify"), "music-app"),
+        (("phim", "movie", "video", "cinema"), "movie-app"),
+        (("chat", "nhắn tin", "message"), "chat-app"),
+        (("blog", "bài viết", "article"), "blog-app"),
+        (("shop", "bán hàng", "ecommerce", "store"), "shop-app"),
+        (("dashboard", "bảng điều khiển", "analytics"), "dashboard-app"),
+        (("todo", "to-do", "công việc"), "todo-app"),
+    )
+    for signals, directory in categories:
+        if any(signal in value for signal in signals):
+            return directory
+    return "product-app"
+
+
+def _autonomous_execution_context(goal: str, product_root: str) -> dict[str, Any]:
+    return {
+        "originalUserGoal": str(goal or "").strip(),
+        "executionClass": "write",
+        "executionMode": "autonomous",
+        "permissionProfile": "workspace-write",
+        "requiresMutation": True,
+        "reportOnly": False,
+        "autoResolveTechnicalChoices": True,
+        "productRoot": product_root,
+    }
+
+
+def build_autonomous_bootstrap(goal: str, workspace_path: str | None = None) -> dict[str, Any]:
+    """Deterministic fallback task when council/worker produce a clarification halt.
+    Returns a self-contained task dict suitable for direct consumption by the worker."""
+    ws = workspace_path or ""
+    from pathlib import Path
+    project_dir = _bootstrap_project_dir(goal)
+    product_root = str(Path(ws).resolve() / project_dir) if ws else project_dir
+    return {
+        "id": f"auto-bootstrap-{int(time.time())}",
+        "kind": "autonomous_bootstrap",
+        "category": "PRODUCT_FOUNDATION",
+        "title": "Autonomous product foundation bootstrap",
+        "source": "anti_halt_controller",
+        "priorityScore": 1.0,
+        "alignmentScore": 1.0,
+        "task": _AUTONOMOUS_BOOTSTRAP_TASK_TEMPLATE.format(
+            goal=goal,
+            product_root=product_root,
+            assumptions=_DEFAULT_ASSUMPTIONS,
+        ),
+        "productRoot": product_root,
+        "originalUserGoal": goal,
+        "executionContext": _autonomous_execution_context(goal, product_root),
+        "assumptions": _DEFAULT_ASSUMPTIONS,
+    }
+
+
 _CATEGORY_ORDER = {
     "security": 0,
     "test_coverage": 1,
     "maintainability": 2,
     "technical_debt": 3,
 }
-
-# Rotating enhancement-idea pool. Used when there are no high-priority
-# findings left, so the loop never starves. Each idea is a small, scoped,
-# safe-by-default improvement the pipeline can attempt end-to-end.
-_ENHANCEMENT_IDEAS: list[dict[str, Any]] = [
-    {
-        "id": "idea-ui-keyboard-shortcuts",
-        "category": "enhancement_ui",
-        "title": "Bổ sung phím tắt cho FlowView",
-        "task": (
-            "Thêm phím tắt cho FlowView trong tab Luồng Agent: phím mũi tên để di chuyển node "
-            "được chọn theo upstream/downstream, phím Esc để bỏ chọn (về Global Live Activity), "
-            "phím số 1-7 để chuyển nhanh giữa các subtab Overview/Activity/I/O/Messages/Tools/Health/Raw. "
-            "Cập nhật hint hiển thị các phím trong panel."
-        ),
-    },
-    {
-        "id": "idea-ui-event-filter",
-        "category": "enhancement_ui",
-        "title": "Filter sự kiện theo eventType và status",
-        "task": (
-            "Thêm filter pills phía trên subtab Activity của Agent Inspector: cho phép lọc theo "
-            "eventType (node_started/node_completed/tool_call/llm_call/warning) và status. "
-            "Khi bật filter chỉ render các event matching, vẫn giữ cap 200/node."
-        ),
-    },
-    {
-        "id": "idea-perf-render-throttle",
-        "category": "enhancement_perf",
-        "title": "Throttle re-render Global panel",
-        "task": (
-            "Throttle _renderInactivePanel xuống ~250ms để tránh jank khi backend emit burst progress "
-            "events (>5 events/giây). Dùng requestAnimationFrame hoặc một guard timer; vẫn đảm bảo "
-            "lần render cuối phản ánh state mới nhất."
-        ),
-    },
-    {
-        "id": "idea-test-replay-roundtrip",
-        "category": "enhancement_tests",
-        "title": "Test replay round-trip cho event schema mới",
-        "task": (
-            "Viết test JS hoặc Python kiểm tra round-trip của progress event qua persistence: "
-            "tạo event với eventId/parentEventId/agentRole/durationMs/tokenUsage, qua "
-            "backendService normalization và sessionStore, replay lại flowView.setEventHistory "
-            "phải tái dựng đầy đủ các field."
-        ),
-    },
-    {
-        "id": "idea-obs-bottleneck-export",
-        "category": "enhancement_observability",
-        "title": "Export bottleneck report ra JSON",
-        "task": (
-            "Thêm nút Export ở Global Live Activity panel: xuất ra JSON danh sách top 5 node có "
-            "durationMs cao nhất trong session, kèm retryCount và tokenUsage. Lưu xuống "
-            ".agent-state/reports/bottleneck-<timestamp>.json."
-        ),
-    },
-    {
-        "id": "idea-ui-search-nodes",
-        "category": "enhancement_ui",
-        "title": "Ô search node trong FlowView",
-        "task": (
-            "Thêm input search nhỏ ở header FlowView; gõ vào sẽ highlight các node có id/label/role "
-            "matching và dim các node còn lại; Enter sẽ chọn node đầu tiên match."
-        ),
-    },
-    {
-        "id": "idea-doctor-history",
-        "category": "enhancement_doctor",
-        "title": "Lưu lịch sử Project Doctor scan",
-        "task": (
-            "Lưu mỗi lần Project Doctor scan vào .agent-state/doctor-history.jsonl, "
-            "thêm endpoint GET /v1/doctor/history trả về 20 lần scan gần nhất, hiển thị trong "
-            "dashboard tab Doctor (nếu chưa có thì render mới một panel nhỏ)."
-        ),
-    },
-    {
-        "id": "idea-flow-mini-timeline",
-        "category": "enhancement_ui",
-        "title": "Mini timeline ở dưới FlowView",
-        "task": (
-            "Thêm một mini timeline strip ở dưới flow canvas hiển thị các event lifecycle "
-            "(node_started/node_completed/node_error) theo trục thời gian; click một marker "
-            "để select node và mở subtab Activity tại event đó."
-        ),
-    },
-]
 
 
 def _format_finding_task(finding: dict[str, Any]) -> str:
@@ -650,93 +712,6 @@ def _detect_agent_engine_workspace(report: dict[str, Any] | None) -> bool:
     )
 
 
-def _build_product_enhancement_pool(
-    goal: str,
-    report: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Generate 6–8 product-aligned task templates from the user's goal.
-    Uses static templates with keyword substitution when the goal matches
-    common product categories (movie/streaming, e-commerce, dashboard, etc.),
-    falling back to a generic capability-builder set."""
-    goal_lower = goal.lower()
-    workspace = str((report or {}).get("workspacePath") or "")
-    wp = workspace.replace("\\", "/").lower()
-
-    # Detect product type
-    product_type = _detect_product_type(goal_lower, wp)
-    if product_type:
-        return _build_typed_pool(goal, product_type, report)
-    return _build_generic_pool(goal, report)
-
-
-def _detect_product_type(goal: str, wp: str) -> str | None:
-    signals = {
-        "streaming_movie": ["phim", "xem phim", "movie", "streaming", "video", "netflix", "flix", "stream", "playlist", "cinema"],
-        "ecommerce": ["shop", "bán hàng", "mua", "cart", "order", "checkout", "product"],
-        "dashboard": ["dashboard", "bảng điều khiển", "analytics", "chart", "biểu đồ", "report", "báo cáo"],
-        "blog": ["blog", "post", "article", "bài viết", "cms", "content"],
-        "game": ["game", "trò chơi", "play", "score", "level"],
-        "chat": ["chat", "message", "messenger", "nhắn tin", "realtime"],
-    }
-    for ptype, words in signals.items():
-        if any(w in goal or w in wp for w in words):
-            return ptype
-    return None
-
-
-def _build_typed_pool(
-    goal: str,
-    product_type: str,
-    report: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Return capability-builder tasks specific to the detected product type."""
-    templates: dict[str, list[dict[str, Any]]] = {
-        "streaming_movie": [
-            {"id": "prod-home", "title": "Trang chủ/catalog phim", "task": "Xây dựng hoặc cải thiện trang chủ hiển thị danh sách phim: carousel phim nổi bật, grid phim mới nhất, lọc theo thể loại. Kiểm tra responsive và loading/error states.", "alignmentScore": 0.95},
-            {"id": "prod-search", "title": "Tìm kiếm & khám phá phim", "task": "Thêm chức năng tìm kiếm phim theo từ khóa (tên phim, diễn viên, đạo diễn). Debounce input, hiển thị results dropdown, empty state khi không tìm thấy.", "alignmentScore": 0.92},
-            {"id": "prod-detail", "title": "Trang chi tiết phim", "task": "Xây dựng trang chi tiết phim: poster, tiêu đề, năm, rating IMDb, mô tả, danh sách diễn viên, phim liên quan. Layout responsive với video player embed.", "alignmentScore": 0.94},
-            {"id": "prod-player", "title": "Video player + controls", "task": "Cải thiện video player: play/pause, seek, volume, fullscreen, quality selector, loading spinner, error fallback (video không khả dụng). Kiểm tra cross-browser.", "alignmentScore": 0.90},
-            {"id": "prod-watchlist", "title": "Watchlist / danh sách yêu thích", "task": "Thêm nút 'Yêu thích'/'Xem sau' vào mỗi movie card. Lưu danh sách vào localStorage/IndexedDB. Hiển thị trang Watchlist riêng, hỗ trợ sort theo ngày thêm và tên.", "alignmentScore": 0.91},
-            {"id": "prod-categories", "title": "Thể loại và lọc phim", "task": "Thêm navigation theo thể loại (Hành động, Hài, Kinh dị, ...). Filter bar trên catalog: genre, year range, rating min. URL-driven filter state (query params).", "alignmentScore": 0.88},
-            {"id": "prod-continue", "title": "Tiếp tục xem / lịch sử", "task": "Lưu tiến độ xem (phút:giây) vào localStorage. Hiển thị 'Tiếp tục xem' section trên trang chủ. Khi quay lại phim → resume từ vị trí đã lưu.", "alignmentScore": 0.86},
-            {"id": "prod-test", "title": "Tests cho các component hiện có", "task": "Viết unit test và integration test cho các component đã có (movie card, player, search, watchlist). Target 70%+ coverage. Dùng Vitest/Jest + Testing Library.", "alignmentScore": 0.82},
-        ],
-        "ecommerce": [
-            {"id": "prod-catalog", "title": "Product catalog grid", "task": "Xây dựng grid sản phẩm với ảnh, giá, rating. Hỗ trợ sort (giá, tên, mới nhất) và filter (category, price range). Responsive 2/3/4 columns.", "alignmentScore": 0.94},
-            {"id": "prod-cart", "title": "Shopping cart + checkout flow", "task": "Thêm giỏ hàng (add/remove/update quantity). Tính tổng tiền. Checkout form với validation. Lưu cart state vào localStorage.", "alignmentScore": 0.92},
-        ],
-        "dashboard": [
-            {"id": "prod-charts", "title": "Data visualization charts", "task": "Thêm chart components (line, bar, pie) hiển thị dữ liệu. Responsive resize. Loading skeleton. Empty state khi chưa có dữ liệu.", "alignmentScore": 0.93},
-            {"id": "prod-filters", "title": "Filter + date-range controls", "task": "Thêm filter controls: date-range picker, dropdown filters, search input. URL-driven state. Debounced fetch.", "alignmentScore": 0.90},
-        ],
-        "blog": [
-            {"id": "prod-post", "title": "Blog post page with markdown", "task": "Xây dựng trang bài viết: markdown render, syntax highlight, table of contents, breadcrumb. Responsive typography.", "alignmentScore": 0.93},
-            {"id": "prod-list", "title": "Blog post list with pagination", "task": "Danh sách bài viết: card grid, pagination/infinite scroll, category filter, search. Loading skeleton.", "alignmentScore": 0.91},
-        ],
-    }
-    defaults = [
-        {"id": "prod-feature", "title": "Core user feature from goal", "task": f"Từ mục tiêu sản phẩm '{goal[:120]}', phân tích code hiện tại và xây dựng hoặc cải thiện một tính năng cốt lõi mà người dùng sẽ tương tác trực tiếp. Ưu tiên tính năng có UI visible. Viết test và verify trong browser.", "alignmentScore": 0.80},
-        {"id": "prod-fix", "title": "Fix regression từ lần thay đổi trước", "task": f"Kiểm tra code đã sửa trong session này liên quan đến '{goal[:100]}'. Chạy test suite, phát hiện test fail hoặc regression, fix từng cái một. Không thêm tính năng mới.", "alignmentScore": 0.75},
-    ]
-    pool = templates.get(product_type, defaults)
-    return pool if len(pool) >= 3 else pool + defaults
-
-
-def _build_generic_pool(
-    goal: str,
-    report: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Capability-builder templates for any product type."""
-    return [
-        {"id": "prod-ui-core", "title": "Xây dựng UI chính của sản phẩm", "task": f"Từ mục tiêu '{goal[:120]}', phân tích code hiện tại. Xác định UI chính mà người dùng sẽ thấy đầu tiên. Xây dựng hoặc cải thiện UI đó: layout, component, responsive. Viết test verify.", "alignmentScore": 0.85},
-        {"id": "prod-feature-gap", "title": "Lấp khoảng trống tính năng", "task": f"Khảo sát code hiện tại trong workspace. So sánh với mục tiêu '{goal[:100]}'. Tìm một tính năng còn thiếu hoặc chưa hoàn thiện. Implement nó. Test.", "alignmentScore": 0.82},
-        {"id": "prod-bug-fix", "title": "Sửa lỗi hiển thị / UX", "task": f"Chạy ứng dụng trong browser. Ghi nhận mọi lỗi hiển thị, broken link, layout xấu, console error trong workspace '{goal[:80]}'. Fix từng cái. Verify sau khi fix.", "alignmentScore": 0.78},
-        {"id": "prod-test-gap", "title": "Test gap coverage", "task": "Kiểm tra test coverage của các component chính. Viết test cho component chưa có test. Target mỗi component có ít nhất 1 unit test + 1 interaction test.", "alignmentScore": 0.76},
-        {"id": "prod-perf", "title": "Performance & loading optimization", "task": "Kiểm tra loading time, image optimization, code splitting. Thêm loading skeletons, lazy load images, optimize bundle. Đo Lighthouse score trước và sau.", "alignmentScore": 0.72},
-        {"id": "prod-a11y", "title": "Accessibility audit", "task": "Kiểm tra keyboard navigation, screen reader, color contrast, focus management. Sửa các vấn đề accessibility cơ bản (alt text, aria labels, focus order).", "alignmentScore": 0.70},
-    ]
-
-
 STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -757,91 +732,180 @@ def select_next_task(
     *,
     idea_cursor: int = 0,
     product_goal: str | None = None,
+    iteration: int = 0,
+    iteration_history: list[dict[str, Any]] | None = None,
+    decompose_subtask: Any = None,
+    council_round: Any = None,
+    session_id: str | None = None,
+    workspace_path: str | None = None,
+    anti_halt_retries: int = 2,
 ) -> dict[str, Any] | None:
-    """Pick the single highest-priority task aligned with product_goal.
+    """Pick the single next task.
 
-    Order:
-      1. Product-aligned findings (workspace scan filtered by goal similarity).
-      2. Product-aligned enhancement ideas (template-based for detected product type).
-      3. PLATFORM_MAINTENANCE pool — only when product_goal is empty or
-         the workspace IS the agent engine itself.
+    Order whenever ``product_goal`` is non-empty (including when the opened
+    workspace also contains the agent platform):
+      0. USER GOAL (iter 0) — feed user's literal prompt as the first task.
+      1. DYNAMIC IDEA COUNCIL — invoke multi-agent council via ``council_round``
+         which must produce a winning proposal (>= 75). No hard-coded backlog.
+         If council output contains clarification halt patterns, mark
+         `invalid_clarification_response`, retry council up to anti_halt_retries
+         times, and if all fail, fall back to deterministic autonomous bootstrap.
+      2. LLM decompose (legacy fallback) — only if ``council_round`` is None.
+
+    When ``product_goal`` is empty OR workspace IS the agent engine: fall back
+    to the read-only ``findings`` list ranked by category. This is the
+    PLATFORM_MAINTENANCE lane and is the ONLY place hard-coded prioritization
+    survives, because there is no user product to align against.
     """
     completed_ids = completed_ids or set()
     findings = list((report or {}).get("findings") or [])
     goal = (product_goal or "").strip()
-    workspace_is_agent_engine = _detect_agent_engine_workspace(report)
+    # A product goal always owns the lane, even when the opened workspace is
+    # the agent platform. In that case the worker creates/uses a productRoot
+    # subdirectory instead of silently switching to platform maintenance.
+    product_goal_active = bool(goal)
 
+    if product_goal_active:
+        if iteration <= 0:
+            user_id = "user-goal-iter0"
+            if user_id not in completed_ids:
+                return {
+                    "id": user_id,
+                    "kind": "user_goal",
+                    "category": "USER_REQUEST",
+                    "title": goal[:80],
+                    "source": "user_prompt",
+                    "priorityScore": 1.0,
+                    "alignmentScore": 1.0,
+                    "task": goal,
+                    "originalUserGoal": goal,
+                    "executionContext": _autonomous_execution_context(goal, ""),
+                }
+        # Iter >= 1: dynamic council generates the next idea from real
+        # repository evidence. NO hard-coded backlog rotation.
+        if callable(council_round):
+            council_result = None
+            halt_hits: list[dict[str, str]] = []
+            for attempt in range(max(1, anti_halt_retries + 1)):
+                try:
+                    council_result = council_round(
+                        goal=goal,
+                        iteration=iteration,
+                        iteration_history=iteration_history or [],
+                        session_id=session_id or "",
+                        workspace_path=workspace_path or "",
+                        # On retry, pass the anti-halt instruction so the council
+                        # can self-correct and generate actual proposals.
+                        anti_halt_instruction=(
+                            "PREVIOUS ATTEMPT RETURNED CLARIFICATION HALT. "
+                            "This is AUTONOMOUS mode — you MUST NOT ask questions or return 'Cần làm rõ' / 'Halt' / 'chờ câu trả lời'. "
+                            "Use the Default Decision Policy: pick the first reasonable option, "
+                            "record the assumption, and produce actionable proposals."
+                            if attempt > 0 else ""
+                        ),
+                    )
+                except Exception as exc:
+                    write_debug_event("autonomy.council_error", {"error": str(exc), "attempt": attempt})
+                    council_result = None
+                    continue
+                if isinstance(council_result, dict):
+                    winner = council_result.get("winner")
+                    if winner:
+                        raw = winner.get("raw") or {}
+                        formatted = str(raw.get("formattedTask") or "")
+                        ok, hits = is_valid_worker_response(formatted)
+                        if not ok:
+                            halt_hits = hits
+                            write_debug_event(
+                                "autonomy.anti_halt.council_winner_retry",
+                                {"attempt": attempt, "hits": hits, "winnerTitle": raw.get("title")},
+                            )
+                            continue
+                        fp = winner.get("fingerprint") or ""
+                        if fp not in completed_ids:
+                            return {
+                                "id": fp,
+                                "kind": "council_idea",
+                                "category": raw.get("productCapability") or "PRODUCT_ITERATION",
+                                "title": str(raw.get("title") or goal[:80]),
+                                "source": "idea_council",
+                                "priorityScore": winner.get("score"),
+                                "scoreBreakdown": winner.get("scoreBreakdown"),
+                                "alignmentScore": min(1.0, (winner.get("score") or 0) / 100.0),
+                                "council": council_result,
+                                "task": formatted,
+                                "originalUserGoal": goal,
+                                "productRoot": str(raw.get("productRoot") or ""),
+                                "executionContext": _autonomous_execution_context(
+                                    goal,
+                                    str(raw.get("productRoot") or workspace_path or ""),
+                                ),
+                            }
+                # Check council proposals for clarification halt patterns.
+                text_blob = json.dumps(council_result, ensure_ascii=False) if council_result else ""
+                ok, hits = is_valid_worker_response(text_blob)
+                if not ok:
+                    halt_hits = hits
+                    write_debug_event(
+                        "autonomy.anti_halt.council_blob_retry",
+                        {"attempt": attempt, "hits": hits},
+                    )
+                    continue
+                # No winner but no halt either — legitimate zero-proposal round.
+                return None
+
+            # All attempts exhausted → deterministic bootstrap.
+            write_debug_event(
+                "autonomy.anti_halt.bootstrap",
+                {"goal": goal, "totalAttempts": anti_halt_retries + 1, "lastHits": halt_hits},
+            )
+            bootstrap = build_autonomous_bootstrap(goal, workspace_path)
+            if bootstrap["id"] not in completed_ids:
+                return bootstrap
+            return None
+
+        if callable(decompose_subtask):
+            try:
+                sub = decompose_subtask(goal, iteration_history or [])
+            except Exception as exc:
+                write_debug_event("autonomy.decompose_error", {"error": str(exc)})
+                sub = None
+            if sub and isinstance(sub, dict) and sub.get("task"):
+                sub_id = str(sub.get("id") or f"user-goal-iter{iteration}")
+                if sub_id not in completed_ids:
+                    return {
+                        "id": sub_id,
+                        "kind": "user_goal_subtask",
+                        "category": "USER_REQUEST",
+                        "title": str(sub.get("title") or goal[:80]),
+                        "source": "llm_decompose",
+                        "priorityScore": 0.95,
+                        "alignmentScore": 1.0,
+                        "task": str(sub["task"]),
+                        "originalUserGoal": goal,
+                        "executionContext": _autonomous_execution_context(goal, ""),
+                    }
+        return None
+
+    # PLATFORM_MAINTENANCE — workspace is the agent engine itself OR no goal.
     def _sort_key(item: dict[str, Any]) -> tuple[int, float]:
         cat = str(item.get("category") or "")
         cat_rank = _CATEGORY_ORDER.get(cat, 10)
         return (cat_rank, -float(item.get("priorityScore") or 0.0))
 
-    # Priority 1: product-aligned workspace findings
-    if goal:
-        for finding in sorted(findings, key=_sort_key):
-            fid = str(finding.get("id") or "")
-            if not fid or fid in completed_ids:
-                continue
-            alignment = _compute_goal_alignment(goal, finding)
-            if alignment >= 0.70:
-                return {
-                    "id": fid,
-                    "kind": "product_finding",
-                    "category": finding.get("category"),
-                    "title": finding.get("title"),
-                    "source": finding.get("source"),
-                    "priorityScore": finding.get("priorityScore"),
-                    "alignmentScore": round(alignment, 3),
-                    "task": _format_finding_task(finding),
-                }
-
-    # Priority 2: product-aligned enhancement ideas
-    if goal:
-        ideas = _build_product_enhancement_pool(goal, report)
-        pool_size = len(ideas)
-        if pool_size > 0:
-            for offset in range(pool_size):
-                idea = ideas[(idea_cursor + offset) % pool_size]
-                if idea["id"] in completed_ids:
-                    continue
-                return {
-                    **idea,
-                    "kind": "product_enhancement",
-                    "alignmentScore": round(float(idea.get("alignmentScore") or 0.95), 3),
-                }
-
-    # Priority 3: PLATFORM_MAINTENANCE — only when no product_goal or the
-    # workspace IS the agent engine itself
-    if workspace_is_agent_engine or not goal:
-        for finding in sorted(findings, key=_sort_key):
-            fid = str(finding.get("id") or "")
-            if not fid or fid in completed_ids:
-                continue
-            return {
-                "id": fid,
-                "kind": "finding",
-                "category": finding.get("category"),
-                "title": finding.get("title"),
-                "source": finding.get("source"),
-                "priorityScore": finding.get("priorityScore"),
-                "task": _format_finding_task(finding),
-            }
-        pool_size = len(_ENHANCEMENT_IDEAS)
-        if pool_size > 0:
-            for offset in range(pool_size):
-                idea = _ENHANCEMENT_IDEAS[(idea_cursor + offset) % pool_size]
-                if idea["id"] in completed_ids:
-                    continue
-                return {
-                    "id": idea["id"],
-                    "kind": "enhancement_idea",
-                    "category": idea["category"],
-                    "title": idea["title"],
-                    "source": "autonomy.enhancement_pool",
-                    "priorityScore": None,
-                    "task": idea["task"],
-                }
-
+    for finding in sorted(findings, key=_sort_key):
+        fid = str(finding.get("id") or "")
+        if not fid or fid in completed_ids:
+            continue
+        return {
+            "id": fid,
+            "kind": "finding",
+            "category": finding.get("category"),
+            "title": finding.get("title"),
+            "source": finding.get("source"),
+            "priorityScore": finding.get("priorityScore"),
+            "task": _format_finding_task(finding),
+        }
     return None
 
 

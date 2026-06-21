@@ -4,7 +4,12 @@ import os
 import tempfile
 import unittest
 
-from agent_engine.graph import _detect_task_intent, _normalize_worker_task_spec
+from agent_engine.graph import (
+    _detect_task_intent,
+    _normalize_worker_task_spec,
+    _resolve_product_workspace,
+    classify_execution,
+)
 
 
 class GraphNormalizationTests(unittest.TestCase):
@@ -31,7 +36,8 @@ class GraphNormalizationTests(unittest.TestCase):
         spec = normalized["workerTaskSpec"]
 
         self.assertEqual(spec["projectStack"], "python")
-        self.assertEqual(spec["targetProjectDir"], "python-app")
+        self.assertTrue(spec["targetProjectDir"].endswith("-app"))
+        self.assertIn("python", spec["targetProjectDir"])
         self.assertEqual(spec["verificationCommands"], ["python -m compileall ."])
         self.assertNotIn("npm run build", spec["verificationCommands"])
 
@@ -65,11 +71,13 @@ class GraphNormalizationTests(unittest.TestCase):
         normalized = _normalize_worker_task_spec(final, state)
         spec = normalized["workerTaskSpec"]
 
-        self.assertEqual(spec["targetProjectDir"], "vocabulary-app")
-        self.assertEqual(spec["projectRoot"], "vocabulary-app")
-        self.assertEqual(spec["verificationCwd"], "vocabulary-app")
-        self.assertIn("vocabulary-app/**", spec["allowedFiles"])
-        self.assertTrue(any("targetProjectDir 'vocabulary-app'" in item for item in spec["constraints"]))
+        target = spec["targetProjectDir"]
+        self.assertTrue(target.endswith("-app"))
+        self.assertNotEqual(target, "app")
+        self.assertEqual(spec["projectRoot"], target)
+        self.assertEqual(spec["verificationCwd"], target)
+        self.assertIn(f"{target}/**", spec["allowedFiles"])
+        self.assertTrue(any(f"targetProjectDir '{target}'" in item for item in spec["constraints"]))
 
     def test_todo_project_overrides_root_cwd_and_allows_target_dir(self) -> None:
         state = {
@@ -88,17 +96,67 @@ class GraphNormalizationTests(unittest.TestCase):
         normalized = _normalize_worker_task_spec(final, state)
         spec = normalized["workerTaskSpec"]
 
-        self.assertEqual(spec["targetProjectDir"], "todo-app")
-        self.assertEqual(spec["projectRoot"], "todo-app")
-        self.assertEqual(spec["verificationCwd"], "todo-app")
+        target = spec["targetProjectDir"]
+        self.assertIn("todo", target)
+        self.assertTrue(target.endswith("-app"))
+        self.assertEqual(spec["projectRoot"], target)
+        self.assertEqual(spec["verificationCwd"], target)
         self.assertIn("package.json", spec["allowedFiles"])
-        self.assertIn("todo-app/**", spec["allowedFiles"])
+        self.assertIn(f"{target}/**", spec["allowedFiles"])
 
     def test_read_only_intent_does_not_require_worker(self) -> None:
         intent = _detect_task_intent("đọc README.md và tóm tắt, không sửa")
 
         self.assertTrue(intent["readOnly"])
         self.assertFalse(intent["requiresWorker"])
+
+    def test_scoped_no_edit_constraint_does_not_downgrade_mutation(self) -> None:
+        task = (
+            "AUTONOMOUS PRODUCT ITERATION — MUTATION_REQUIRED=true\n"
+            "Original goal: code web nghe nhạc\n"
+            "Không sửa agent platform. Phải tạo thay đổi hoạt động được."
+        )
+        admission = classify_execution(task)
+
+        self.assertEqual(admission["executionClass"], "write")
+        self.assertTrue(admission["taskIntent"]["requiresWorker"])
+        self.assertFalse(admission["taskIntent"]["readOnly"])
+        self.assertIn("không sửa", admission["taskIntent"]["signals"]["scopedNoEdit"])
+
+    def test_structured_autonomous_contract_forces_mutation(self) -> None:
+        admission = classify_execution(
+            "Khảo sát rồi triển khai trong productRoot; không sửa agent platform.",
+            {
+                "executionClass": "write",
+                "requiresMutation": True,
+                "permissionProfile": "workspace-write",
+            },
+        )
+
+        self.assertEqual(admission["executionClass"], "write")
+        self.assertTrue(admission["taskIntent"]["forcedMutation"])
+        self.assertTrue(admission["taskIntent"]["requiresWorker"])
+
+    def test_product_noun_in_analysis_request_is_not_mutation(self) -> None:
+        admission = classify_execution("phân tích website này và báo cáo kiến trúc")
+
+        self.assertEqual(admission["executionClass"], "read_only")
+        self.assertFalse(admission["taskIntent"]["requiresWorker"])
+
+    def test_doctor_scope_resolves_to_product_root_and_rejects_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            product = os.path.join(root, "music-app")
+            os.makedirs(product)
+
+            self.assertEqual(
+                str(_resolve_product_workspace(root, {"targetProjectDir": "music-app"})),
+                os.path.realpath(product),
+            )
+            self.assertEqual(
+                str(_resolve_product_workspace(root, {"targetProjectDir": "../outside"})),
+                os.path.realpath(root),
+            )
 
 
 if __name__ == "__main__":

@@ -154,7 +154,8 @@ const state = {
     log: [],
     lastTask: null,
     nextAttemptAt: null,
-    consecutiveErrors: 0
+    consecutiveErrors: 0,
+    history: []
   }
 };
 
@@ -338,10 +339,11 @@ function stageLabel(stage) {
 function runStatus(run = latestRun()) {
   if (state.running) return "running";
   if (!run) return "idle";
-  if (run.error) return "error";
+  const backendStatus = String(run.status || "").toLowerCase();
+  if (run.error || run.completed === false || ["failed", "error", "incomplete"].includes(backendStatus)) return "error";
   if (run.humanGate?.status === "pending") return "waiting";
   const blockers = run.review?.blockers || [];
-  if (Array.isArray(blockers) && blockers.length) return "blocked";
+  if (backendStatus === "blocked" || run.review?.passed === false || (Array.isArray(blockers) && blockers.length)) return "blocked";
   return "completed";
 }
 
@@ -583,6 +585,32 @@ function renderFlowIO() {
   if (!E.flowIOPanel) return;
   const run = latestRun();
   if (!run) {
+    const esc0 = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    if (state.running) {
+      const taskNow = state.activeTask || state.activeSession?.title || "(đang chạy)";
+      const evs = Array.isArray(state.progress) ? state.progress.slice(-15) : [];
+      const lines = evs.map((ev) =>
+        `<div class="event-row"><span class="event-time">${esc0(ev.at || "")}</span><span class="event-stage">${esc0(ev.node || ev.stage || "-")}</span><span class="event-detail">${esc0(String(ev.detail || "").slice(0, 200))}</span></div>`
+      ).join("");
+      E.flowIOPanel.innerHTML = `
+        <div class="io-panel-header">
+          <h3 style="margin:0;font-size:14px">Đang chạy</h3>
+          <div class="io-pills"><span class="io-pill io-pill-running">Live</span></div>
+        </div>
+        <div class="io-grid">
+          <section class="io-col">
+            <h4>Đầu vào (task của bạn)</h4>
+            <pre class="io-content">${esc0(taskNow)}</pre>
+          </section>
+          <section class="io-col">
+            <h4>Sự kiện gần nhất (live)</h4>
+            <div class="io-content" style="max-height:280px;overflow:auto">${lines || '<p class="muted">Chờ event đầu tiên…</p>'}</div>
+          </section>
+        </div>
+        <p class="muted" style="font-size:11px;margin-top:8px">Mở tab Stream của node để xem token/cmd live.</p>`;
+      return;
+    }
     E.flowIOPanel.innerHTML =
       `<p class="muted" style="padding:24px;text-align:center">Chạy một task ở tab "Tổng quan" để xem input → output ở đây.</p>`;
     return;
@@ -596,7 +624,7 @@ function renderFlowIO() {
   const blockers = Array.isArray(run.review?.blockers) ? run.review.blockers : [];
   const warnings = Array.isArray(run.review?.warnings) ? run.review.warnings : [];
   const changedFiles = Array.isArray(run.changedFiles) ? run.changedFiles : [];
-  const testsPassed = run.tester?.passed;
+  const testsPassed = run.testerResult?.passed ?? run.tester?.passed;
   const status = runStatus(run);
 
   const verdictPill = (() => {
@@ -936,6 +964,41 @@ const AUTO_LOOP_STORAGE_KEY = "fractal.autoLoop.v1";
 const AUTO_LOOP_MAX_LOG = 80;
 const AUTO_LOOP_BACKOFF_MS = 4000;
 const AUTO_LOOP_MAX_CONSECUTIVE_ERRORS = 3;
+// Watchdog: defense-in-depth so the loop can never stall waiting on an event
+// that never arrives (e.g. a hung backend that the client timeout already
+// aborted, but whose agent:run-finished never fired). Independent of
+// agent:run-finished.
+const AUTO_LOOP_WATCHDOG_MS = Number(window.__AUTO_LOOP_WATCHDOG_MS) || 3900000; // ~65 min, > client hard timeout
+let __autoLoopWatchdog = null;
+
+function clearAutoLoopWatchdog() {
+  if (__autoLoopWatchdog) {
+    clearTimeout(__autoLoopWatchdog);
+    __autoLoopWatchdog = null;
+  }
+}
+
+function armAutoLoopWatchdog() {
+  clearAutoLoopWatchdog();
+  if (!state.autoLoop.enabled) return;
+  __autoLoopWatchdog = setTimeout(async () => {
+    __autoLoopWatchdog = null;
+    if (!state.autoLoop.enabled) return;
+    autoLoopLog("Watchdog: iteration treo quá lâu — huỷ run và lên lịch lại.", "warn");
+    try {
+      const execId = state.activeRun?.executionId || window.__currentExecutionId;
+      if (window.__currentSendController) {
+        try { window.__currentSendController.abort(); } catch (e) {}
+        window.__currentSendController = null;
+      }
+      if (execId && typeof appApi.cancelRun === "function") {
+        try { await appApi.cancelRun(execId); } catch (e) {}
+      }
+    } catch (e) {}
+    state.running = false;
+    scheduleAutoLoopTick(AUTO_LOOP_BACKOFF_MS);
+  }, AUTO_LOOP_WATCHDOG_MS);
+}
 
 function autoLoopLog(message, level = "info") {
   const at = new Date().toISOString();
@@ -951,7 +1014,8 @@ function persistAutoLoop() {
       enabled: !!state.autoLoop.enabled,
       iterations: state.autoLoop.iterations,
       completedIds: state.autoLoop.completedIds.slice(-200),
-      ideaCursor: state.autoLoop.ideaCursor
+      ideaCursor: state.autoLoop.ideaCursor,
+      history: state.autoLoop.history.slice(-20)
     }));
   } catch {}
 }
@@ -964,6 +1028,7 @@ function restoreAutoLoop() {
     state.autoLoop.iterations = Number(saved.iterations || 0);
     state.autoLoop.completedIds = Array.isArray(saved.completedIds) ? saved.completedIds : [];
     state.autoLoop.ideaCursor = Number(saved.ideaCursor || 0);
+    state.autoLoop.history = Array.isArray(saved.history) ? saved.history.slice(-20) : [];
     // Do NOT auto-restore "enabled=true" — require explicit user toggle each session
     // so a stuck loop from a previous session doesn't fire on relaunch.
   } catch {}
@@ -985,18 +1050,31 @@ async function autoLoopTick() {
   }
 
   try {
-    const rescanIfStale = state.autoLoop.iterations === 0 || (state.autoLoop.iterations % 5 === 0);
-    const productGoal = state.activeSession?.productGoal || state.activeTask || "";
+    const lastUserMessage = [...(state.activeSession?.messages || [])]
+      .reverse()
+      .find((item) => item?.role === "user" && String(item?.content || "").trim());
+    const productGoal = state.activeSession?.productGoal
+      || String(lastUserMessage?.content || "").trim()
+      || state.activeTask
+      || "";
+    const rescanIfStale = !productGoal && (state.autoLoop.iterations === 0 || (state.autoLoop.iterations % 5 === 0));
     const reply = await appApi.requestAutonomyNextTask({
       workspacePath: workspace,
       completedIds: state.autoLoop.completedIds,
       ideaCursor: state.autoLoop.ideaCursor,
       rescanIfStale,
-      productGoal
+      productGoal,
+      sessionId: state.activeSession?.id || state.sessionId || "",
+      iteration: state.autoLoop.iterations,
+      iterationHistory: state.autoLoop.history.slice(-6),
+      settings: {
+        serverUrl: state.settings?.serverUrl || "",
+        model: state.settings?.modelOverrides?.planner || state.settings?.model || "",
+        apiKey: state.settings?.apiKey || ""
+      }
     });
     if (!reply?.task) {
-      autoLoopLog("Không còn finding/ý tưởng nào — chờ scan mới.", "info");
-      // Schedule next attempt — after a rescan it should find ideas again.
+      autoLoopLog("Không còn task nào để chạy — chờ scan mới.", "info");
       scheduleAutoLoopTick(15000);
       return;
     }
@@ -1009,9 +1087,83 @@ async function autoLoopTick() {
     const kind = reply.task.kind || "finding";
     const cat = reply.task.category || "";
     autoLoopLog(`#${state.autoLoop.iterations} [${kind}/${cat}] ${reply.task.title || reply.task.id}`, "task");
+    if (productGoal && kind !== "council_idea" && kind !== "user_goal") {
+      autoLoopLog(`⚠ Task không phải council_idea (${kind}) — có thể không khớp goal "${productGoal.slice(0, 60)}"`, "warn");
+    }
+    if (reply.task.council) {
+      const council = reply.task.council;
+      const capStatuses = (council.capabilityMap?.capabilities || []).map(c => `${c.name}:${c.status}`).join(", ");
+      autoLoopLog(`Council ns=${council.namespace || "?"} productRoot=${council.capabilityMap?.productRoot || "?"}`, "info");
+      if (capStatuses) autoLoopLog(`Capabilities: ${capStatuses}`, "info");
+      const props = council.proposals || [];
+      const kept = props.filter(p => !p.rejected);
+      const rejected = props.filter(p => p.rejected);
+      autoLoopLog(`Proposed by ${[...new Set(props.map(p => p.proposer))].join("/")} — kept ${kept.length}, rejected ${rejected.length}`, "info");
+      for (const r of rejected) {
+        autoLoopLog(`  ✗ [${r.proposer}] ${r.raw?.title || "?"} — ${r.rejectionReason}`, "warn");
+      }
+      const winner = council.winner;
+      if (winner) {
+        const sb = winner.scoreBreakdown || {};
+        autoLoopLog(`  ✓ WINNER [${winner.proposer}] ${winner.raw?.title} — score ${winner.score} (G${sb.goalRelevance}/U${sb.userValue}/E${sb.evidenceStrength}/C${sb.productCompleteness}/F${sb.feasibility}/R${sb.riskReduction})`, "ok");
+      }
+    }
+    armAutoLoopWatchdog();
     const runResult = await runTask(reply.task.task, {
-      startDetail: `Auto Loop · ${reply.task.title || reply.task.id}`
+      startDetail: `Auto Loop · ${reply.task.title || reply.task.id}`,
+      executionContext: {
+        ...(reply.task.executionContext || {}),
+        originalUserGoal: reply.task.originalUserGoal || productGoal,
+        executionClass: "write",
+        executionMode: "autonomous",
+        permissionProfile: "workspace-write",
+        requiresMutation: true,
+        reportOnly: false,
+        autoResolveTechnicalChoices: true,
+        productRoot: reply.task.productRoot || reply.task.executionContext?.productRoot || ""
+      }
     });
+    state.autoLoop.history.push({
+      id: reply.task.id,
+      task: String(reply.task.task || "").slice(0, 400),
+      title: reply.task.title || "",
+      result: runResult?.ok ? "success" : `failed: ${runResult?.error || runResult?.reason || "unknown"}`,
+      ts: Date.now()
+    });
+    if (state.autoLoop.history.length > 20) state.autoLoop.history = state.autoLoop.history.slice(-20);
+    if (typeof appApi.recordMemory === "function") {
+      try {
+        let lesson = runResult?.ok
+          ? `Completed: ${String(reply.task.task || "").slice(0, 200)}`
+          : `Failed: ${runResult?.error || runResult?.reason || "unknown"}`;
+        if (!runResult?.ok && typeof appApi.critiqueMemory === "function") {
+          try {
+            const crit = await appApi.critiqueMemory({
+              settings: {
+                serverUrl: state.settings?.serverUrl || "",
+                model: state.settings?.modelOverrides?.reviewer || state.settings?.model || "",
+                apiKey: state.settings?.apiKey || ""
+              },
+              goal: productGoal,
+              subtask: reply.task.title || reply.task.id,
+              error: runResult?.error || runResult?.reason || "",
+              output: String(runResult?.assistantText || "").slice(0, 1200)
+            });
+            if (crit?.lesson) lesson = crit.lesson;
+          } catch {}
+        }
+        await appApi.recordMemory({
+          goal: productGoal,
+          subtask: reply.task.title || reply.task.id,
+          verdict: runResult?.ok ? "pass" : "fail",
+          lesson,
+          files: Array.isArray(runResult?.changedFiles) ? runResult.changedFiles : [],
+          tokensIn: runResult?.tokenUsage?.input || 0,
+          tokensOut: runResult?.tokenUsage?.output || 0
+        });
+      } catch {}
+    }
+    clearAutoLoopWatchdog();
     if (runResult?.ok) {
       state.autoLoop.consecutiveErrors = 0;
       autoLoopLog(`✓ Done iteration ${state.autoLoop.iterations}`, "ok");
@@ -1024,8 +1176,13 @@ async function autoLoopTick() {
         return;
       }
     }
-    // runTask emits "agent:run-finished" → handler will schedule next tick.
+    // Schedule the next tick directly. The agent:run-finished handler also
+    // schedules, but scheduleAutoLoopTick is idempotent-by-replacement (each
+    // arms a fresh timer + nextAttemptAt) so we no longer depend on the event
+    // firing — a hung/aborted run still advances the loop.
+    scheduleAutoLoopTick(AUTO_LOOP_BACKOFF_MS);
   } catch (error) {
+    clearAutoLoopWatchdog();
     state.autoLoop.consecutiveErrors += 1;
     autoLoopLog(`Lỗi next-task: ${error.message}`, "error");
     if (state.autoLoop.consecutiveErrors >= AUTO_LOOP_MAX_CONSECUTIVE_ERRORS) {
@@ -1038,10 +1195,20 @@ async function autoLoopTick() {
 
 function scheduleAutoLoopTick(delayMs = 1500) {
   if (!state.autoLoop.enabled) return;
+  clearAutoLoopWatchdog();
+  // Replace any pending tick so duplicate triggers (direct call + run-finished
+  // event) collapse into one.
+  if (window.__autoLoopTickTimer) clearTimeout(window.__autoLoopTickTimer);
   state.autoLoop.nextAttemptAt = Date.now() + delayMs;
   renderAutoLoop();
-  setTimeout(() => {
+  window.__autoLoopTickTimer = setTimeout(() => {
+    window.__autoLoopTickTimer = null;
     if (!state.autoLoop.enabled) return;
+    if (state.running) {
+      // A run is still active (event/direct schedule raced). Re-check shortly.
+      scheduleAutoLoopTick(1500);
+      return;
+    }
     autoLoopTick();
   }, delayMs);
 }
@@ -1079,6 +1246,8 @@ function autoLoopSetEnabled(enabled) {
   } else {
     autoLoopLog("Tắt Auto Loop", "info");
     state.autoLoop.nextAttemptAt = null;
+    clearAutoLoopWatchdog();
+    if (window.__autoLoopTickTimer) { clearTimeout(window.__autoLoopTickTimer); window.__autoLoopTickTimer = null; }
   }
   persistAutoLoop();
   renderAutoLoop();
@@ -1087,7 +1256,13 @@ function autoLoopSetEnabled(enabled) {
 
 function renderAutoLoop() {
   // Show product goal so user can verify Auto Loop stays on track.
-  const pg = state.activeSession?.productGoal || state.activeTask || "";
+  const lastUserMessage = [...(state.activeSession?.messages || [])]
+    .reverse()
+    .find((item) => item?.role === "user" && String(item?.content || "").trim());
+  const pg = state.activeSession?.productGoal
+    || String(lastUserMessage?.content || "").trim()
+    || state.activeTask
+    || "";
   if (E.autoLoopStatus && pg && !E.autoLoopStatus.dataset.goalShown) {
     E.autoLoopStatus.dataset.goalShown = "1";
   }
@@ -1130,6 +1305,7 @@ function renderAutoLoop() {
 }
 
 window.addEventListener("agent:run-finished", () => {
+  clearAutoLoopWatchdog();
   if (!state.autoLoop.enabled) return;
   scheduleAutoLoopTick(2000);
 });
@@ -1262,15 +1438,17 @@ async function runTask(content, opts = {}) {
       sessionId: session.id,
       workspacePath: getWorkspacePath(),
       settings: state.settings,
-      content
+      content,
+      executionContext: opts.executionContext || null
     });
+    const returnedRun = result?.run || (result?.session ? null : result);
     if (result?.session) {
       state.activeSession = result.session;
       if (Array.isArray(result.sessions?.sessions)) state.sessions = result.sessions.sessions;
     } else {
       // Browser/dev mode talks to Python directly and receives a run rather
       // than Electron's { session, sessions, run } response envelope.
-      const run = result?.run || result;
+      const run = returnedRun;
       const runIdentity = run?.executionId || run?.id;
       const priorRuns = Array.isArray(session.runs) ? session.runs : [];
       const observedRun = {
@@ -1300,9 +1478,18 @@ async function runTask(content, opts = {}) {
     window.__currentSendController = null;
     render();
     if (E.messageInput) E.messageInput.focus();
-    // Notify the auto-loop scheduler this run finished so it can pick the next task.
-    try { window.dispatchEvent(new CustomEvent("agent:run-finished", { detail: { ok: true, result } })); } catch {}
-    return { ok: true, result };
+    const observedRun = returnedRun || result?.run || null;
+    const runFailed = observedRun?.completed === false
+      || ["failed", "error", "blocked", "incomplete"].includes(String(observedRun?.status || "").toLowerCase())
+      || observedRun?.review?.passed === false;
+    // Notify the auto-loop scheduler only with the verified run outcome.
+    try { window.dispatchEvent(new CustomEvent("agent:run-finished", { detail: { ok: !runFailed, result } })); } catch {}
+    return {
+      ...(observedRun || {}),
+      ok: !runFailed,
+      result,
+      reason: runFailed ? "verification_failed" : undefined
+    };
   } catch (error) {
     setStatus(`Chưa gửi được yêu cầu: ${error.message}`, 3600);
     state.running = false;

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import time
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
@@ -518,6 +519,11 @@ def _run_deterministic_scaffold_fallback(
     )
 
 
+class WorkerInterrupted(Exception):
+    """Raised from inside the OpenHands callback to abort conversation.run()
+    when the user cancels or the worker wall-clock deadline is exceeded."""
+
+
 def run_openhands_worker(
     *,
     workspace: str,
@@ -531,6 +537,7 @@ def run_openhands_worker(
     worker_attempt: int = 1,
     dependency_workspace: str | None = None,
     worktree_isolated: bool = False,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     container_available = _container_available(worker_task_spec)
     emit("coder_agent", "Starting OpenHands coding agent" if container_available else "Starting policy-limited coding worker without Docker/Podman")
@@ -566,7 +573,32 @@ def run_openhands_worker(
     fallback_result: dict[str, Any] | None = None
     run_result: Any = None
 
+    # Worker wall-clock deadline: caps the worst-case hang at the source
+    # (otherwise up to 80 iterations × 300s LLM timeout with no overall bound).
+    _deadline_s = float(os.environ.get("AGENT_WORKER_DEADLINE_SECONDS", "1800"))
+    _started_at = time.monotonic()
+    _interrupt_reason: dict[str, str] = {}
+
+    def _should_interrupt() -> str | None:
+        if is_cancelled is not None:
+            try:
+                if is_cancelled():
+                    return "cancelled"
+            except Exception:
+                pass
+        if _deadline_s > 0 and (time.monotonic() - _started_at) >= _deadline_s:
+            return "deadline"
+        return None
+
     def on_event(event: Any) -> None:
+        # Responsive cancel / deadline: conversation.run() invokes this callback
+        # on every step, so raising here aborts a long run mid-flight instead of
+        # waiting for it to exhaust all 80 iterations.
+        reason = _should_interrupt()
+        if reason:
+            _interrupt_reason["reason"] = reason
+            emit("coder_agent", f"Worker interrupted ({reason})")
+            raise WorkerInterrupted(reason)
         stage, detail = _event_summary(event)
         event_name = event.__class__.__name__
         tool_name = str(getattr(event, "tool_name", "") or "")
@@ -780,6 +812,44 @@ def run_openhands_worker(
                             else:
                                 raise
                     run_result = conversation.run()
+            except WorkerInterrupted as exc:
+                reason = _interrupt_reason.get("reason", str(exc) or "interrupted")
+                # Preserve any files the worker managed to write before the
+                # interrupt, then surface it. A user cancel re-raises so the
+                # pipeline's cancellation path takes over; a deadline returns a
+                # partial result carrying the timeout so the reviewer can react.
+                try:
+                    policy = enforce_change_policy(
+                        sandbox_workspace,
+                        before_snapshot,
+                        list(worker_task_spec.get("allowedFiles") or []),
+                        list(worker_task_spec.get("forbiddenPaths") or []),
+                    )
+                    applied = list(policy["changedFiles"]) if worktree_isolated else apply_sandbox_changes(workspace, sandbox_workspace, policy["changedFiles"])
+                except Exception:
+                    policy = {"sandboxDiff": [], "violations": []}
+                    applied = []
+                if sandbox:
+                    try:
+                        sandbox.complete()
+                    except Exception:
+                        pass
+                if reason == "cancelled":
+                    raise
+                return _worker_result(
+                    workspace=workspace,
+                    worker_task_spec=worker_task_spec,
+                    summary=f"Coder agent stopped: worker deadline exceeded (AGENT_WORKER_DEADLINE_SECONDS={int(_deadline_s)}s).",
+                    error=f"worker_deadline_exceeded_{int(_deadline_s)}s",
+                    model=openhands_model,
+                    raw_result=run_result,
+                    sandbox_diff=policy.get("sandboxDiff"),
+                    policy_violations=policy.get("violations") or [],
+                    applied_changes=applied,
+                    scaffold_fallback=fallback_result,
+                    sandboxed=True,
+                    events=events,
+                )
             except Exception as exc:
                 if is_transient_error(exc):
                     emit("resume", f"OpenHands transient failure persisted for retry: {exc}")

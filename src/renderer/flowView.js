@@ -180,6 +180,13 @@ class FlowView {
   }
 
   _refreshElapsed() {
+    // Live-tick the per-node speed chips for running nodes so the elapsed/%
+    // counter advances without waiting for the next progress event.
+    if (this.statusMap && this.nodeElements) {
+      for (const [nid, s] of this.statusMap.entries()) {
+        if (s === "running") this._refreshNodeSpeed(nid);
+      }
+    }
     if (!this.statusEls || !this._startedAt) return;
     const ms = Date.now() - this._startedAt;
     const s = Math.floor(ms / 1000);
@@ -411,17 +418,20 @@ class FlowView {
     nodeLayer.setAttribute("class", "flow-nodes");
     this.nodeElements = new Map();
     for (const [id, n] of this.nodeIndex.entries()) {
+      const role = this.topology.roles?.[id] || n.role || "agent";
       const g = document.createElementNS(NS, "g");
       g.setAttribute("class", "flow-node");
       g.setAttribute("transform", `translate(${n.x}, ${n.y})`);
+      g.setAttribute("role", "button");
+      g.setAttribute("aria-label", `${n.label} ${role} node`);
       g.style.cursor = "pointer";
+      g.setAttribute("tabindex", "0");
       // Background rect with gradient
       const rect = document.createElementNS(NS, "rect");
       rect.setAttribute("width", NODE_W); rect.setAttribute("height", NODE_H);
       rect.setAttribute("rx", NODE_RX); rect.setAttribute("ry", NODE_RX);
       g.appendChild(rect);
       // Role icon
-      const role = this.topology.roles?.[id] || n.role || "agent";
       const icon = ROLE_ICONS[role] || "○";
       const iconEl = document.createElementNS(NS, "text");
       iconEl.setAttribute("x", 16); iconEl.setAttribute("y", NODE_H / 2 + 5);
@@ -440,13 +450,20 @@ class FlowView {
       dot.setAttribute("cx", NODE_W - 14); dot.setAttribute("cy", NODE_H / 2);
       dot.setAttribute("r", 5); dot.setAttribute("class", "flow-node-dot");
       g.appendChild(dot);
+      // Speed / load chip (elapsed + fast/slow band). Bottom-right of node.
+      const speedEl = document.createElementNS(NS, "text");
+      speedEl.setAttribute("x", NODE_W - 24); speedEl.setAttribute("y", NODE_H - 7);
+      speedEl.setAttribute("font-size", "9.5"); speedEl.setAttribute("text-anchor", "end");
+      speedEl.setAttribute("font-family", "ui-monospace, monospace");
+      speedEl.setAttribute("class", "flow-node-speed");
+      g.appendChild(speedEl);
       // Interactions
       g.addEventListener("mousedown", (ev) => ev.stopPropagation());
       g.addEventListener("click", (ev) => { ev.stopPropagation(); this._selectNode(id); });
       g.addEventListener("mouseenter", () => this._highlightNeighborhood(id));
       g.addEventListener("mouseleave", () => this._clearHighlight());
       nodeLayer.appendChild(g);
-      this.nodeElements.set(id, { g, rect, icon: iconEl, label, dot });
+      this.nodeElements.set(id, { g, rect, icon: iconEl, label, dot, speedEl });
     }
     viewport.appendChild(nodeLayer);
 
@@ -663,6 +680,49 @@ class FlowView {
     else if (status === "done") el.rect.setAttribute("filter", "url(#node-glow-done)");
     else if (status === "error") el.rect.setAttribute("filter", "url(#node-glow-error)");
     else el.rect.removeAttribute("filter");
+    this._refreshNodeSpeed(id);
+  }
+
+  // Per-node expected duration budget (ms). Used to classify fast/slow so the
+  // node chip can show a speed band. Heavy nodes (worker, doctor) get a larger
+  // budget. Tunable; falls back to a default for unlisted nodes.
+  _expectedMs(id) {
+    const BUDGET = {
+      openhands_worker: 120000, doctor_feedback: 90000,
+      tester_agent: 60000, code_reviewer_agent: 45000,
+      repo_intelligence: 40000, planner_task_graph: 30000,
+      security: 30000, release_deploy_agent: 20000,
+    };
+    return BUDGET[id] || 15000;
+  }
+
+  // Returns {text, cls} for the node speed chip. For a running node, shows live
+  // elapsed + a % of budget; for a completed node, elapsed + fast/slow band.
+  _nodeSpeed(id) {
+    const ms = this._nodeElapsedMs(id);
+    if (ms == null) return { text: "", cls: "" };
+    const status = this.statusMap.get(id) || "idle";
+    const budget = this._expectedMs(id);
+    const ratio = ms / budget; // <1 fast, 1-2 normal, >2 slow
+    let cls = "speed-fast";
+    if (ratio > 2) cls = "speed-slow";
+    else if (ratio > 1) cls = "speed-warn";
+    if (status === "running") {
+      const pct = Math.min(999, Math.round(ratio * 100));
+      return { text: `${this._formatMs(ms)} · ${pct}%`, cls };
+    }
+    if (status === "done" || status === "error") {
+      const band = ratio <= 1 ? "⚡" : ratio <= 2 ? "•" : "🐢";
+      return { text: `${band} ${this._formatMs(ms)}`, cls };
+    }
+    return { text: "", cls: "" };
+  }
+
+  _refreshNodeSpeed(id) {
+    const el = this.nodeElements.get(id); if (!el || !el.speedEl) return;
+    const { text, cls } = this._nodeSpeed(id);
+    el.speedEl.textContent = text;
+    el.speedEl.setAttribute("class", `flow-node-speed ${cls}`);
   }
 
   _pulseEdgesInto(id) {
@@ -885,7 +945,7 @@ class FlowView {
 
     // Subnav
     const tabs = [
-      ["overview", "Overview"], ["activity", "Activity"], ["io", "I/O"],
+      ["overview", "Overview"], ["activity", "Activity"], ["stream", "Stream"], ["io", "I/O"],
       ["messages", "Messages"], ["tools", "Tools"], ["health", "Health"], ["raw", "Raw"]
     ];
     h += `<div class="flow-subnav">`;
@@ -906,6 +966,7 @@ class FlowView {
     switch (tab) {
       case "overview":  return this._subOverview(id, ctx);
       case "activity":  return this._subActivity(id, ctx);
+      case "stream":    return this._subStream(id, ctx);
       case "io":        return this._subIO(id, ctx);
       case "messages":  return this._subMessages(id, ctx);
       case "tools":     return this._subTools(id, ctx);
@@ -913,6 +974,35 @@ class FlowView {
       case "raw":       return this._subRaw(id, ctx);
       default:          return this._subOverview(id, ctx);
     }
+  }
+
+  _subStream(id, { events }) {
+    const chunks = events.filter(e => (e.eventType === "llm_chunk" || e.eventType === "cmd_chunk") && (e.chunkText || e.detail));
+    if (!chunks.length) {
+      return `<p class="muted">Chưa có stream chunk. Khi LLM hoặc cmd phát chunk, output sẽ hiện ở đây realtime.</p>`;
+    }
+    let llmText = "";
+    const cmdLines = [];
+    for (const ev of chunks) {
+      const text = String(ev.chunkText || ev.detail || "");
+      if (ev.eventType === "llm_chunk") {
+        llmText += text;
+      } else {
+        const tag = ev.tool === "stderr" ? "err" : "out";
+        cmdLines.push(`<span class="cmd-${tag}">[${tag}]</span> ${escapeHtml(text)}`);
+      }
+    }
+    let h = "";
+    if (llmText) {
+      h += `<h4 class="flow-detail-h4">🧠 LLM stream</h4>`;
+      h += `<pre class="event-json flow-stream-pre" style="max-height:340px;overflow:auto;white-space:pre-wrap">${escapeHtml(llmText)}</pre>`;
+    }
+    if (cmdLines.length) {
+      h += `<h4 class="flow-detail-h4">⌨ Shell stream</h4>`;
+      h += `<pre class="event-json flow-stream-pre" style="max-height:240px;overflow:auto">${cmdLines.join("<br>")}</pre>`;
+    }
+    h += `<p class="muted" style="margin-top:8px;font-size:11px">${chunks.length} chunks · auto-scroll khi mới.</p>`;
+    return h;
   }
 
   _subOverview(id, { events, lastEv }) {
@@ -973,34 +1063,61 @@ class FlowView {
   _subIO(id, { events }) {
     const started = events.find(e => e.eventType === "node_started");
     const completed = [...events].reverse().find(e => e.eventType === "node_completed");
+    // Prefer the full payload (graph.py now emits input=/output= at a large
+    // cap); fall back to the short summary for older events.
+    const inputText = (started && (started.input || started.inputSummary)) || "";
+    const outputText = (completed && (completed.output || completed.outputSummary)) || "";
+    const block = (text, kind) => {
+      const s = String(text);
+      const isFull = (kind === "in" ? (started && started.input) : (completed && completed.output));
+      const bytes = s.length;
+      const meta = isFull ? `${bytes.toLocaleString()} ký tự` : "summary (rút gọn)";
+      return `<div class="io-block">
+        <div class="io-meta muted">${meta}</div>
+        <pre class="event-json io-scroll">${escapeHtml(s)}</pre>
+      </div>`;
+    };
     let h = "";
     h += `<h4 class="flow-detail-h4">↘ Input</h4>`;
-    if (started && started.inputSummary) {
-      h += `<pre class="event-json">${escapeHtml(String(started.inputSummary))}</pre>`;
-    } else {
-      h += `<p class="muted">Chưa có input summary (cần sự kiện node_started).</p>`;
-    }
+    h += inputText
+      ? block(inputText, "in")
+      : `<p class="muted">Chưa có input (cần sự kiện node_started).</p>`;
     h += `<h4 class="flow-detail-h4">↗ Output</h4>`;
-    if (completed && completed.outputSummary) {
-      h += `<pre class="event-json">${escapeHtml(String(completed.outputSummary))}</pre>`;
-    } else {
-      h += `<p class="muted">Chưa có output summary (cần sự kiện node_completed).</p>`;
-    }
+    h += outputText
+      ? block(outputText, "out")
+      : `<p class="muted">Chưa có output (cần sự kiện node_completed).</p>`;
     return h;
   }
 
   _subMessages(id, { events }) {
     const calls = events.filter(e => e.eventType === "llm_call" || e.model);
     if (!calls.length) return `<p class="muted">Chưa có LLM call nào được ghi nhận cho node này.</p>`;
-    let h = `<table class="kv-table"><thead><tr><th>Time</th><th>Model</th><th>Tokens</th><th>Detail</th></tr></thead><tbody>`;
+    let h = "";
     for (const ev of calls) {
       const time = escapeHtml(this._formatTime(ev.at));
       const model = escapeHtml(ev.model || "");
       const tu = ev.tokenUsage || {};
       const tokens = typeof tu === "object" ? Object.entries(tu).map(([k,v]) => `${k}:${v}`).join(" ") : String(tu);
-      h += `<tr><td>${time}</td><td>${model}</td><td>${escapeHtml(tokens)}</td><td>${escapeHtml(String(ev.detail || "").slice(0, 160))}</td></tr>`;
+      // Prompt = input/promptTemplate; Response = output. Either may be absent.
+      const prompt = ev.input || ev.promptTemplate || "";
+      const response = ev.output || "";
+      h += `<div class="msg-call">
+        <div class="msg-head">
+          <span class="muted" style="font-family:monospace;font-size:10.5px">${time}</span>
+          <span class="msg-model">${model}</span>
+          <span class="muted" style="font-size:10.5px">${escapeHtml(tokens)}</span>
+        </div>`;
+      if (prompt) {
+        h += `<details class="msg-io"><summary>↘ Prompt (${String(prompt).length.toLocaleString()} ký tự)</summary><pre>${escapeHtml(String(prompt))}</pre></details>`;
+      }
+      if (response) {
+        h += `<details class="msg-io" open><summary>↗ Response (${String(response).length.toLocaleString()} ký tự)</summary><pre>${escapeHtml(String(response))}</pre></details>`;
+      }
+      if (!prompt && !response && ev.detail) {
+        h += `<p class="muted" style="font-size:11px;margin:2px 0">${escapeHtml(String(ev.detail).slice(0, 300))}</p>`;
+      }
+      h += `</div>`;
     }
-    h += `</tbody></table>`;
     return h;
   }
 

@@ -4,6 +4,7 @@ import hashlib
 import fnmatch
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -870,7 +871,33 @@ def is_safe_command(command: str) -> bool:
     return lower.startswith(("pytest", "go test", "cargo test", "dotnet test", "mvn test", "gradle test", "flutter", "dart"))
 
 
-def run_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".", sandboxed: bool = False) -> dict[str, Any]:
+def _resolve_shell_cmd(command: str) -> tuple[list[str] | str, bool]:
+    """Pick the host shell.
+
+    Windows: prefer cmd.exe for npm/pnpm/yarn/node (their .cmd shims run without
+    the ExecutionPolicy gate that blocks the .ps1 shims). Use PowerShell only
+    for commands that genuinely need it (Get-*, Set-*, $env:, etc.). When we do
+    use PowerShell, bypass ExecutionPolicy so global tools still work.
+    """
+    if platform.system() == "Windows":
+        lower = command.strip().lower()
+        needs_powershell = any(
+            tok in lower
+            for tok in ("get-", "set-", "$env:", "new-item", "test-path", "select-string", "where-object", "foreach-object")
+        )
+        if not needs_powershell:
+            comspec = os.environ.get("ComSpec") or shutil.which("cmd.exe") or "cmd.exe"
+            return ([comspec, "/d", "/s", "/c", command], False)
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if pwsh:
+            return (
+                [pwsh, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+                False,
+            )
+    return (command, True)
+
+
+def run_command(workspace: str, command: str, timeout: int = 120, cwd: str = ".", sandboxed: bool = False, emit_chunk: Any = None) -> dict[str, Any]:
     root = Path(workspace).resolve()
     with checkpoint_step(
         "tool",
@@ -895,18 +922,64 @@ def run_command(workspace: str, command: str, timeout: int = 120, cwd: str = "."
                     telemetry.set_span_attrs(span, {"tool.skipped": True, "tool.skip_reason": "cwd_escape"})
                     result = {"command": command, "cwd": cwd, "skipped": True, "reason": "Command cwd escapes workspace.", "sandboxed": sandboxed}
                 else:
+                    cmd_args, use_shell = _resolve_shell_cmd(command)
                     try:
-                        proc = subprocess.run(command, cwd=str(workdir), shell=True, capture_output=True, text=True, timeout=timeout)
-                        telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
-                        result = {
-                            "command": command,
-                            "cwd": cwd,
-                            "code": proc.returncode,
-                            "stdout": proc.stdout[-20000:],
-                            "stderr": proc.stderr[-20000:],
-                            "timedOut": False,
-                            "sandboxed": sandboxed,
-                        }
+                        if callable(emit_chunk):
+                            stdout_buf: list[str] = []
+                            stderr_buf: list[str] = []
+                            proc_p = subprocess.Popen(
+                                cmd_args,
+                                cwd=str(workdir),
+                                shell=use_shell,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                bufsize=1,
+                            )
+                            import threading
+                            def _drain(stream: Any, sink: list[str], tag: str) -> None:
+                                try:
+                                    for line in iter(stream.readline, ""):
+                                        if not line:
+                                            break
+                                        sink.append(line)
+                                        try:
+                                            emit_chunk(tag, line.rstrip("\n"))
+                                        except Exception:
+                                            pass
+                                finally:
+                                    try: stream.close()
+                                    except Exception: pass
+                            t_out = threading.Thread(target=_drain, args=(proc_p.stdout, stdout_buf, "stdout"), daemon=True)
+                            t_err = threading.Thread(target=_drain, args=(proc_p.stderr, stderr_buf, "stderr"), daemon=True)
+                            t_out.start(); t_err.start()
+                            try:
+                                proc_p.wait(timeout=timeout)
+                            except subprocess.TimeoutExpired:
+                                proc_p.kill()
+                                t_out.join(timeout=2); t_err.join(timeout=2)
+                                telemetry.set_span_attrs(span, {"tool.exit_code": -1, "tool.timed_out": True})
+                                result = {"command": command, "cwd": cwd, "code": None, "stdout": "".join(stdout_buf)[-20000:], "stderr": "".join(stderr_buf)[-20000:], "timedOut": True, "sandboxed": sandboxed}
+                            else:
+                                t_out.join(timeout=2); t_err.join(timeout=2)
+                                telemetry.set_span_attrs(span, {"tool.exit_code": proc_p.returncode, "tool.timed_out": False})
+                                result = {
+                                    "command": command, "cwd": cwd, "code": proc_p.returncode,
+                                    "stdout": "".join(stdout_buf)[-20000:], "stderr": "".join(stderr_buf)[-20000:],
+                                    "timedOut": False, "sandboxed": sandboxed,
+                                }
+                        else:
+                            proc = subprocess.run(cmd_args, cwd=str(workdir), shell=use_shell, capture_output=True, text=True, timeout=timeout)
+                            telemetry.set_span_attrs(span, {"tool.exit_code": proc.returncode, "tool.timed_out": False})
+                            result = {
+                                "command": command,
+                                "cwd": cwd,
+                                "code": proc.returncode,
+                                "stdout": proc.stdout[-20000:],
+                                "stderr": proc.stderr[-20000:],
+                                "timedOut": False,
+                                "sandboxed": sandboxed,
+                            }
                     except subprocess.TimeoutExpired as exc:
                         telemetry.set_span_attrs(span, {"tool.exit_code": -1, "tool.timed_out": True})
                         if sandboxed:

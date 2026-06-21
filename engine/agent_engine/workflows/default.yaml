@@ -53,13 +53,11 @@ edges:
   - [governance_service, human_gate]
   - [load_context_files, openhands_worker]
   - [openhands_worker, tester_agent]
-  - [tester_agent, security_reviewer_agent]
   - [security_reviewer_agent, code_reviewer_agent]
   - [code_reviewer_agent, doctor_feedback]
   - [doctor_feedback, release_deploy_agent]
   - [release_deploy_agent, reviewer_decision]
   - [read_only_reporter, finalize_workspace]
-  - [reporter, finalize_workspace]
   - [finalize_workspace, END]
   - [reporter_end, END]
 
@@ -96,18 +94,26 @@ routes:
         target: reporter
     default: load_context_files
 
+  tester_agent:
+    cases:
+      - when: tester_failed_can_rework
+        target: openhands_worker
+    default: security_reviewer_agent
+
+  reporter:
+    cases:
+      - when: mutation_task_no_evidence
+        target: reporter_end
+    default: finalize_workspace
+
   reviewer_decision:
     cases:
       - when: has_result
         target: reporter
-      - when: worker_error
-        target: reporter
+      - when: worker_error_can_rework
+        target: openhands_worker
       - when: blocked
         target: reporter
-      - when: replan_required
-        target: plan_arbiter
-      - when: changes_required
-        target: openhands_worker
       - when: can_rework
         target: openhands_worker
       - when: review_passed
@@ -223,6 +229,10 @@ contextRoutes:
     - releasePlan
   reporter:
     - latestReview
+    - problem
+    - task
+  reporter_end:
+    - result
   finalize_workspace:
     - task
     - executionId

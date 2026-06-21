@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld("agentApp", {
   getAutonomyStatus: () => ipcRenderer.invoke("agent:autonomy-status"),
   runAutonomyScan: (payload) => ipcRenderer.invoke("agent:autonomy-scan", payload),
   requestAutonomyNextTask: (payload) => ipcRenderer.invoke("agent:autonomy-next-task", payload),
+  recordMemory: (payload) => ipcRenderer.invoke("agent:memory-record", payload),
+  critiqueMemory: (payload) => ipcRenderer.invoke("agent:memory-critique", payload),
   getFullPowerStatus: () => ipcRenderer.invoke("agent:full-power-status"),
   getTopology: () => ipcRenderer.invoke("agent:topology"),
   cancelRun: (executionId) => ipcRenderer.invoke("agent:cancel", executionId),

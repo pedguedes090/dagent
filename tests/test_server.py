@@ -331,6 +331,69 @@ class ServerSmokeTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
+    def test_autonomous_contract_routes_scoped_no_edit_task_to_write_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
+            os.environ["AGENT_ENGINE_STATE_DIR"] = temp_dir
+            httpd = agent_server.ThreadingHTTPServer(("127.0.0.1", 0), agent_server.AgentRequestHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            observed: dict = {}
+
+            def fake_pipeline(payload, _emit):
+                observed.update(payload)
+                return {
+                    "id": payload["executionId"],
+                    "executionId": payload["executionId"],
+                    "status": "success",
+                    "completed": True,
+                    "assistantText": "done",
+                    "changedFiles": [{"path": "music-app/src/app.tsx", "status": "modified"}],
+                    "commandResults": [{"command": "npm run build", "code": 0}],
+                    "review": {"passed": True},
+                }
+
+            try:
+                with mock.patch.object(agent_server, "run_pipeline", side_effect=fake_pipeline):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{httpd.server_port}/v1/runs",
+                        data=json.dumps(
+                            {
+                                "sessionId": "session-auto",
+                                "workspacePath": temp_dir,
+                                "content": "AUTONOMOUS PRODUCT ITERATION — không sửa agent platform; triển khai music app",
+                                "executionContext": {
+                                    "originalUserGoal": "code web nghe nhạc",
+                                    "executionClass": "write",
+                                    "executionMode": "autonomous",
+                                    "permissionProfile": "workspace-write",
+                                    "requiresMutation": True,
+                                    "reportOnly": False,
+                                },
+                                "settings": {"serverUrl": "http://model.test/v1", "model": "test-model", "apiKey": ""},
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json; charset=utf-8"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        body = response.read().decode("utf-8")
+
+                messages = [json.loads(line) for line in body.splitlines() if line.strip()]
+                self.assertTrue(any(item.get("stage") == "running" and "Write lane" in item.get("detail", "") for item in messages))
+                self.assertFalse(any("Read-only lane" in item.get("detail", "") for item in messages))
+                self.assertTrue(observed["executionContext"]["requiresMutation"])
+                self.assertEqual(observed["executionContext"]["originalUserGoal"], "code web nghe nhạc")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
+                if old_state_dir is None:
+                    os.environ.pop("AGENT_ENGINE_STATE_DIR", None)
+                else:
+                    os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
+
 
 if __name__ == "__main__":
     unittest.main()

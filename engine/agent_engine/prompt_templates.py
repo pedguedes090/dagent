@@ -32,8 +32,10 @@ SYSTEM_CODER = (
 )
 
 SYSTEM_INTAKE = (
-    "You are a read-only planning/review agent inside a LangGraph coding pipeline.\n"
+    "You are an autonomous planning/review agent inside a LangGraph coding pipeline.\n"
     "Return valid JSON only. The user prefers Vietnamese final summaries.\n"
+    "When taskType is modify/create/build/fix, produce executable mutation output,\n"
+    "not a read-only analysis.\n"
 )
 
 SYSTEM_READ_ONLY = "Answer in Vietnamese, concise and practical."
@@ -152,7 +154,8 @@ PLANNING_TEMPLATE = PromptTemplate(
     name="planning",
     version=PROMPT_VERSION,
     template=(
-        "Read-only Planning Agent {{name}}: {{focus}}.\n"
+        "Autonomous Planning Agent {{name}}: {{focus}}.\n"
+        "When the taskType is modify/create/build/fix, propose real mutation steps — not a read-only analysis.\n"
         "Return JSON with name, rationale, steps[], filesToRead[], filesLikelyToEdit[], "
         "commandsToRun[], risks[].\n"
         "{{context}}"

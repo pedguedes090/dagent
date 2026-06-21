@@ -17,7 +17,7 @@ from .broker import SQLiteAgentBroker
 from .debug_log import write_debug_event
 from .deterministic_workflow import DEFAULT_WORKFLOW
 from .durable_execution import DurableExecutionStore
-from .graph import classify_execution, request_cancel, run_pipeline
+from .graph import classify_execution, is_cancelled, request_cancel, run_pipeline
 from .project_doctor import run_doctor
 from .state_store import control_plane_path, migrate_legacy_tables
 
@@ -239,6 +239,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             payload["autonomyScanActive"] = _AUTONOMY_LOCK.locked()
             self._send_json(200, payload)
             return
+        if self.path.startswith("/v1/agents"):
+            self._handle_agents()
+            return
+        # A2A well-known discovery
+        if self.path == "/.well-known/agent-card.json":
+            from .a2a.agent_registry import get_agent_registry
+            orch = get_agent_registry().get("orchestrator")
+            if orch:
+                self._send_json(200, orch.to_dict())
+            else:
+                self._send_json(200, {"name": "orchestrator", "protocolVersion": "0.3.0", "capabilities": []})
+            return
         self._send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -247,6 +259,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/autonomy/next-task":
             self._handle_autonomy_next_task()
+            return
+        if self.path == "/v1/memory/record":
+            self._handle_memory_record()
+            return
+        if self.path == "/v1/memory/critique":
+            self._handle_memory_critique()
             return
         if self.path == "/v1/runs/cancel":
             try:
@@ -280,7 +298,10 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         headers = {key.lower(): value for key, value in self.headers.items()}
         correlation_id = telemetry.set_correlation_id(headers.get("x-correlation-id") or payload.get("correlationId"))
         payload["correlationId"] = correlation_id
-        admission = classify_execution(str(payload.get("content") or payload.get("task") or ""))
+        admission = classify_execution(
+            str(payload.get("content") or payload.get("task") or ""),
+            dict(payload.get("executionContext") or {}),
+        )
         execution_class = str(admission["executionClass"])
         payload["executionClass"] = execution_class
         write_debug_event(
@@ -306,8 +327,14 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def write_line(message: dict[str, Any]) -> None:
-            self.wfile.write(_json_line(message))
-            self.wfile.flush()
+            # Guard the socket write: if the renderer stalled or disconnected,
+            # a blocking write can wedge the pipeline thread driving this run.
+            # Swallow disconnect errors so the orchestrator can finish/cleanup.
+            try:
+                self.wfile.write(_json_line(message))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
         # First line so the client learns the executionId before any work starts.
         write_line({"type": "ready", "executionId": execution_id_for_stream, "correlationId": correlation_id,
@@ -351,6 +378,8 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 "tool_input", "tool_result", "changed_files",
                 "evidence", "blockers", "confidence",
                 "sequence", "issue_count", "passed",
+                # Live stream chunks (LLM text_delta + cmd stdout/stderr lines)
+                "chunk_text",
             )
             for key in ALLOWED:
                 if key in fields and fields[key] is not None:
@@ -381,13 +410,46 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     if not _WRITE_LOCK.acquire(blocking=False):
                         write_debug_event("run.queued", {"correlationId": correlation_id, "executionClass": execution_class})
                         emit("queued", "Another write-capable run is active; waiting for the write lock")
-                        _WRITE_LOCK.acquire()
+                        # Bounded wait so a single hung write run cannot queue
+                        # every subsequent run (incl. Auto Loop) forever. Poll in
+                        # slices, honoring cancel + an overall ceiling.
+                        lock_wait_deadline = float(os.environ.get("AGENT_WRITE_LOCK_WAIT_SECONDS", "1800"))
+                        waited = 0.0
+                        while not _WRITE_LOCK.acquire(timeout=5):
+                            waited += 5
+                            if is_cancelled(execution_id_for_stream):
+                                emit("cancelled", "Run cancelled while waiting for the write lock", status="cancelled")
+                                write_line({"type": "error", "error": "cancelled_while_queued"})
+                                return
+                            if waited >= lock_wait_deadline:
+                                emit("timeout", f"Write lock unavailable after {int(waited)}s; aborting to avoid a deadlock", status="error")
+                                write_line({"type": "error", "error": f"write_lock_timeout_{int(waited)}s"})
+                                return
+                            emit("queued", f"Still waiting for write lock ({int(waited)}s)")
                     lock_acquired = True
                     write_debug_event("run.running", {"correlationId": correlation_id, "executionClass": execution_class})
-                    emit("running", "Write lane admitted")
+                    emit(
+                        "running",
+                        "Write lane admitted",
+                        status="running",
+                        input_summary=str(payload.get("content") or "")[:500],
+                        evidence={
+                            "executionClass": execution_class,
+                            "executionMode": (payload.get("executionContext") or {}).get("executionMode") or "interactive",
+                            "permissionProfile": (payload.get("executionContext") or {}).get("permissionProfile") or "workspace-policy",
+                            "requiresMutation": bool((payload.get("executionContext") or {}).get("requiresMutation")),
+                            "originalUserGoal": (payload.get("executionContext") or {}).get("originalUserGoal") or payload.get("content"),
+                        },
+                    )
                 else:
                     write_debug_event("run.running", {"correlationId": correlation_id, "executionClass": execution_class})
-                    emit("running", "Read-only lane admitted without the write lock")
+                    emit(
+                        "running",
+                        "Read-only lane admitted without the write lock",
+                        status="running",
+                        input_summary=str(payload.get("content") or "")[:500],
+                        evidence={"executionClass": execution_class, "permissionProfile": "read-only"},
+                    )
                 result = run_pipeline(payload, emit)
                 if span:
                     span.set_attribute("run.id", result.get("id", ""))
@@ -420,12 +482,13 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         raw_workspace_path = str(payload.get("workspacePath") or "").strip()
         if not raw_workspace_path:
-            self._send_json(400, {"error": "workspacePath is required"})
-            return
+            raw_workspace_path = os.getcwd()
         workspace_path = Path(raw_workspace_path).expanduser()
         if not workspace_path.exists() or not workspace_path.is_dir():
-            self._send_json(400, {"error": "workspacePath must be an existing directory"})
-            return
+            workspace_path = Path(os.getcwd())
+            if not workspace_path.exists() or not workspace_path.is_dir():
+                self._send_json(400, {"error": "workspacePath must be an existing directory"})
+                return
 
         headers = {key.lower(): value for key, value in self.headers.items()}
         correlation_id = telemetry.set_correlation_id(headers.get("x-correlation-id") or payload.get("correlationId"))
@@ -486,17 +549,33 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             return
         raw_workspace = str(payload.get("workspacePath") or "").strip()
         if not raw_workspace:
-            self._send_json(400, {"error": "workspacePath is required"})
-            return
+            raw_workspace = os.getcwd()
         workspace_path = Path(raw_workspace).expanduser()
         if not workspace_path.exists() or not workspace_path.is_dir():
-            self._send_json(400, {"error": "workspacePath must be an existing directory"})
-            return
+            workspace_path = Path(os.getcwd())
+            if not workspace_path.exists() or not workspace_path.is_dir():
+                self._send_json(400, {"error": "workspacePath must be an existing directory"})
+                return
 
         completed_ids = set(map(str, payload.get("completedIds") or []))
         idea_cursor = int(payload.get("ideaCursor") or 0)
         rescan_if_stale = bool(payload.get("rescanIfStale"))
         product_goal = str(payload.get("productGoal") or "").strip()
+        iteration = int(payload.get("iteration") or 0)
+        iteration_history = payload.get("iterationHistory") or []
+        if not isinstance(iteration_history, list):
+            iteration_history = []
+        settings = payload.get("settings") or {}
+        session_id = str(payload.get("sessionId") or "").strip()
+        recent_browser_findings = payload.get("recentBrowserFindings") or []
+        if not isinstance(recent_browser_findings, list):
+            recent_browser_findings = []
+        failing_tests = payload.get("failingTests") or []
+        if not isinstance(failing_tests, list):
+            failing_tests = []
+        console_errors = payload.get("consoleErrors") or []
+        if not isinstance(console_errors, list):
+            console_errors = []
 
         state_dir = _state_dir_path()
         report = (autonomy_status(state_dir) or {}).get("lastReport")
@@ -513,10 +592,140 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 finally:
                     _AUTONOMY_LOCK.release()
 
-        task = select_next_task(report, completed_ids, idea_cursor=idea_cursor, product_goal=product_goal)
+        def _decompose(goal: str, history: list[dict[str, Any]]) -> dict[str, Any] | None:
+            """Ask the LLM for the next concrete sub-task given goal + history."""
+            try:
+                from .llm_client import ChatClient
+                from .agent_memory import build_memory_context
+                server_url = str(settings.get("serverUrl") or os.environ.get("AGENT_LLM_BASE_URL") or "").strip()
+                model = str(settings.get("model") or os.environ.get("ANTHROPIC_MODEL") or "claude-opus-4-8").strip()
+                api_key = str(settings.get("apiKey") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+                if not server_url or not api_key:
+                    return None
+                client = ChatClient(server_url, model, api_key)
+                summarized = []
+                for item in (history or [])[-6:]:
+                    if not isinstance(item, dict):
+                        continue
+                    summarized.append({
+                        "task": str(item.get("task") or item.get("title") or "")[:200],
+                        "result": str(item.get("result") or item.get("verdict") or "")[:200],
+                    })
+                memory_ctx = build_memory_context(goal, k=3)
+                sys_prompt = (
+                    "You decompose a long-running product goal into the SINGLE next concrete sub-task. "
+                    "Output strict JSON: {\"id\":\"<slug>\",\"title\":\"<8 words>\",\"task\":\"<imperative one-paragraph instruction>\"}. "
+                    "Produce an EXECUTABLE mutation task, not a read-only analysis. The task must instruct the "
+                    "worker to make real file edits, run commands, and verify with browser. "
+                    "The sub-task must directly advance the user's goal, build on what's already done, "
+                    "be doable in one agent run (file edits + 1 verification), and produce visible progress. "
+                    "MUTATION_REQUIRED=true: Do NOT produce a plan/report. Produce working code changes. "
+                    "Do NOT repeat completed work. Do NOT propose generic refactor/test/perf if a core feature is still missing."
+                )
+                if memory_ctx:
+                    sys_prompt = sys_prompt + "\n\n" + memory_ctx
+                user_msg = json.dumps({
+                    "goal": goal,
+                    "iteration": iteration,
+                    "completed": summarized,
+                }, ensure_ascii=False)
+                raw = client.chat(
+                    [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0.4,
+                    json_mode=True,
+                )
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    return None
+                if not isinstance(parsed, dict) or not parsed.get("task"):
+                    return None
+                return parsed
+            except Exception as exc:
+                write_debug_event("autonomy.decompose_error", {"error": str(exc)})
+                return None
+
+        def _council_round(*, goal: str, iteration: int, iteration_history: list[dict[str, Any]], session_id: str, workspace_path: str, anti_halt_instruction: str = "") -> dict[str, Any] | None:
+            try:
+                from .llm_client import ChatClient
+                from .idea_council import (
+                    scan_capabilities,
+                    run_council_round,
+                    format_winner_task,
+                )
+                server_url = str(settings.get("serverUrl") or os.environ.get("AGENT_LLM_BASE_URL") or "").strip()
+                model = str(settings.get("model") or os.environ.get("ANTHROPIC_MODEL") or "claude-opus-4-8").strip()
+                api_key = str(settings.get("apiKey") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+                if not server_url or not api_key:
+                    write_debug_event("council.skipped", {"reason": "no_llm_credentials"})
+                    return None
+                client = ChatClient(server_url, model, api_key)
+                cap_map = scan_capabilities(workspace_path, goal)
+
+                def chat(messages: list[dict[str, str]], temperature: float, json_mode: bool) -> str:
+                    return client.chat(messages, temperature=temperature, json_mode=json_mode)
+
+                result = run_council_round(
+                    goal=goal,
+                    session_id=session_id,
+                    workspace_path=workspace_path,
+                    state_dir=Path(state_dir),
+                    capability_map=cap_map,
+                    iteration=iteration,
+                    iteration_history=iteration_history,
+                    chat=chat,
+                    recent_browser_findings=recent_browser_findings,
+                    failing_tests=failing_tests,
+                    console_errors=console_errors,
+                    anti_halt_instruction=anti_halt_instruction,
+                )
+                winner = result.get("winner") if isinstance(result, dict) else None
+                if winner:
+                    raw = winner.get("raw") or {}
+                    raw["productRoot"] = cap_map.productRoot
+                    raw["formattedTask"] = format_winner_task(winner, goal, cap_map.productRoot)
+                    winner["raw"] = raw
+                return result
+            except Exception as exc:
+                write_debug_event("council.error", {"error": str(exc)})
+                return None
+
+        task = select_next_task(
+            report,
+            completed_ids,
+            idea_cursor=idea_cursor,
+            product_goal=product_goal,
+            iteration=iteration,
+            iteration_history=iteration_history,
+            decompose_subtask=_decompose,
+            council_round=_council_round,
+            session_id=session_id,
+            workspace_path=str(workspace_path.resolve()),
+        )
+        # Ensure council-idea and autonomous-bootstrap tasks carry explicit write context
+        if task and isinstance(task, dict):
+            kind = str(task.get("kind") or "")
+            if kind in {"council_idea", "autonomous_bootstrap", "user_goal", "user_goal_subtask"}:
+                task["requiresWorker"] = True
+                task["executionClass"] = "write"
+                task["autonomous"] = True
+                execution_context = dict(task.get("executionContext") or {})
+                execution_context.update({
+                    "originalUserGoal": str(task.get("originalUserGoal") or product_goal or "").strip(),
+                    "executionClass": "write",
+                    "executionMode": "autonomous",
+                    "permissionProfile": "workspace-write",
+                    "requiresMutation": True,
+                    "reportOnly": False,
+                    "autoResolveTechnicalChoices": True,
+                    "productRoot": str(task.get("productRoot") or execution_context.get("productRoot") or ""),
+                })
+                task["executionContext"] = execution_context
+
         next_cursor = idea_cursor
-        if task and task.get("kind") == "enhancement_idea":
-            next_cursor = (idea_cursor + 1) % 8  # pool size; small constant ok here.
         write_debug_event(
             "autonomy.next_task",
             {
@@ -536,6 +745,93 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 "autonomyScanActive": _AUTONOMY_LOCK.locked(),
             },
         )
+
+    def _handle_agents(self) -> None:
+        """Handle GET /.well-known/agent-card.json, GET /v1/agents, GET /v1/agents/{id}."""
+        from .a2a.agent_registry import get_agent_registry
+        registry = get_agent_registry()
+        path = self.path
+        if path == "/v1/agents" or path == "/v1/agents/":
+            cards = registry.list_all()
+            self._send_json(200, {"agents": [c.to_dict() for c in cards], "count": len(cards)})
+            return
+        prefix = "/v1/agents/"
+        if path.startswith(prefix):
+            agent_id = path[len(prefix):].split("?")[0].strip("/")
+            card = registry.get(agent_id)
+            if card:
+                self._send_json(200, card.to_dict())
+            else:
+                self._send_json(404, {"error": "agent_not_found", "agentId": agent_id, "validIds": registry.list_ids()})
+            return
+        self._send_json(404, {"error": "not_found"})
+
+    def _handle_memory_record(self) -> None:
+        """Persist one Auto Loop iteration outcome to the agent memory store."""
+        try:
+            payload = self._read_json_body()
+        except Exception as exc:
+            self._send_json(400, {"error": f"invalid_json: {exc}"})
+            return
+        try:
+            from .agent_memory import record_iteration, get_memory
+            record_iteration(
+                goal=str(payload.get("goal") or ""),
+                subtask=str(payload.get("subtask") or ""),
+                verdict=str(payload.get("verdict") or "unknown"),
+                lesson=str(payload.get("lesson") or ""),
+                files=payload.get("files") or [],
+                tokens_in=int(payload.get("tokensIn") or 0),
+                tokens_out=int(payload.get("tokensOut") or 0),
+                extra=payload.get("extra") if isinstance(payload.get("extra"), dict) else None,
+            )
+            self._send_json(200, {"ok": True, "summary": get_memory().summary()})
+        except Exception as exc:
+            write_debug_event("memory.record_error", {"error": str(exc)})
+            self._send_json(500, {"ok": False, "error": str(exc)})
+
+    def _handle_memory_critique(self) -> None:
+        """Generate a one-sentence lesson from a failed iteration via LLM."""
+        try:
+            payload = self._read_json_body()
+        except Exception as exc:
+            self._send_json(400, {"error": f"invalid_json: {exc}"})
+            return
+        try:
+            from .llm_client import ChatClient
+            settings = payload.get("settings") or {}
+            server_url = str(settings.get("serverUrl") or os.environ.get("AGENT_LLM_BASE_URL") or "").strip()
+            model = str(settings.get("model") or os.environ.get("ANTHROPIC_MODEL") or "claude-opus-4-8").strip()
+            api_key = str(settings.get("apiKey") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+            if not server_url or not api_key:
+                self._send_json(200, {"ok": False, "lesson": ""})
+                return
+            client = ChatClient(server_url, model, api_key)
+            sys = (
+                "You distill an iteration failure into ONE short lesson (one sentence, <30 words) "
+                "that a future iteration should remember to avoid the same mistake. Output JSON: "
+                "{\"lesson\": \"<sentence>\"}."
+            )
+            user_msg = json.dumps({
+                "goal": payload.get("goal") or "",
+                "subtask": payload.get("subtask") or "",
+                "error": payload.get("error") or payload.get("reason") or "",
+                "output": str(payload.get("output") or "")[:1200],
+            }, ensure_ascii=False)
+            raw = client.chat(
+                [{"role": "system", "content": sys}, {"role": "user", "content": user_msg}],
+                temperature=0.2,
+                json_mode=True,
+            )
+            try:
+                parsed = json.loads(raw)
+                lesson = str(parsed.get("lesson") or "").strip()
+            except Exception:
+                lesson = ""
+            self._send_json(200, {"ok": bool(lesson), "lesson": lesson})
+        except Exception as exc:
+            write_debug_event("memory.critique_error", {"error": str(exc)})
+            self._send_json(500, {"ok": False, "error": str(exc)})
 
     def _handle_doctor(self) -> None:
         """Stream scan→plan→patch→verify events as NDJSON.

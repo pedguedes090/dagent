@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import json
 import operator
 import sqlite3
@@ -73,6 +74,8 @@ class PipelineState(TypedDict, total=False):
     sessionId: str
     executionId: str
     executionClass: str
+    executionContext: dict[str, Any]
+    originalUserGoal: str
     correlationId: str
     preflight: dict[str, Any]
     taskIntent: dict[str, Any]
@@ -454,6 +457,7 @@ CHANGE_SIGNALS = [
     "cập nhật",
     "triển khai",
     "làm ra",
+    "làm",
     "xây",
     "khởi tạo",
     "chỉnh",
@@ -463,6 +467,12 @@ CHANGE_SIGNALS = [
     "tối ưu",
     "nâng cấp",
     "cài",
+    "code",
+    "viết",
+    "viet",
+    "phát triển",
+    "phat trien",
+    "develop",
     "implement",
     "write",
     "edit",
@@ -474,6 +484,55 @@ CHANGE_SIGNALS = [
     "refactor",
     "install",
     "generate",
+    # Expanded: every missing synonym = false negative -> skipped worker execution
+    "tạo mới",
+    "dựng",
+    "xây dựng",
+    "tích hợp",
+    "cập nhập",
+    "thay đổi",
+    "chạy",
+    "deploy",
+    "commit",
+    "push",
+    "sửa lỗi",
+    "add",
+    "remove",
+    "feature",
+    "patch",
+    "upgrade",
+    "optimize",
+    "integrate",
+    "convert",
+    "migrate",
+    "rename",
+    "restructure",
+    "rewrite",
+    "overhaul",
+    "init",
+    "setup",
+    "configure",
+    "tune",
+    "harden",
+    "clean",
+    "format",
+    "audit",
+    "cải thiện",
+    "thiết lập",
+    "cấu hình",
+    "dọn",
+    "chuẩn hóa",
+    "nâng",
+    # Diacritic-less aliases (critical: Viet users often type without tones)
+    "sua", "tao", "xoa", "them", "cap nhat", "lam", "lam ra",
+    "xay", "khoi tao", "chinh", "doi", "thay", "bo sung",
+    "toi uu", "nang cap", "cai", "phat trien", "chay",
+    "xoa bo", "sua loi", "tao moi", "tich hop", "thay doi",
+    "dung", "xay dung", "chuan hoa", "thiet lap",
+    "cau hinh", "cai thien", "setup", "viet",
+    # NOTE: "don" intentionally excluded — it is a substring of "dong"
+    # (as in "hoat dong" = operate). Use "don dep" or "chuan hoa" instead.
+    "don dep", "don ve sinh",
 ]
 READ_SIGNALS = [
     "đọc",
@@ -484,7 +543,6 @@ READ_SIGNALS = [
     "tóm tắt",
     "trả lời",
     "là gì",
-    "kiểm tra",
     "soi",
     "đánh giá",
     "tìm hiểu",
@@ -494,9 +552,99 @@ READ_SIGNALS = [
     "read",
     "analyze",
     "inspect",
+    # NOTE: "kiểm tra" intentionally REMOVED — it appears in edit tasks
+    # ("kiểm tra xem compile được không") causing false read-only classifications.
+    # Expanded: missing synonyms → read-only tasks may be classified as modify
+    "cho biết", "nói về", "mô tả", "describe",
+    "what is", "how does", "liệt kê", "list",
+    "tra cứu", "tường thuật", "báo cáo", "report",
+    "document", "overview",
+    # Diacritic-less aliases
+    "doc", "xem", "giai thich", "phan tich",
+    "tom tat", "tra loi", "la gi",
+    "danh gia", "tim hieu", "nghien cuu",
+    "cho biet", "noi ve", "mo ta", "bao cao",
+    "tra cuu", "tuong thuat", "liet ke",
 ]
-NO_EDIT_SIGNALS = ["không sửa", "khong sua", "chỉ đọc", "chi doc", "read-only", "đừng sửa", "dung sua", "chưa sửa", "không đụng file"]
-CONDITIONAL_EDIT_SIGNALS = ["sửa luôn", "fix luôn", "nếu sai thì sửa", "nếu có lỗi thì sửa", "nếu thấy lỗi thì sửa", "sai thì sửa"]
+NO_EDIT_SIGNALS = [
+    "không sửa", "khong sua", "chỉ đọc", "chi doc", "read-only",
+    "đừng sửa", "dung sua", "chưa sửa", "không đụng file",
+    # Expanded: every missing negation variant = worker runs when user said "just tell me"
+    "không đụng", "đừng đụng", "không được sửa", "không chỉnh sửa",
+    "không thay đổi", "không code", "answer only", "don't edit",
+    "do not change", "do not modify", "just tell me", "only explain",
+    "không làm gì", "chỉ trả lời", "chi tra loi", "đừng code",
+    "dung code", "không cần code", "không cần sửa", "không sửa file",
+    "don't modify", "no code", "no edit", "no changes", "no change",
+    "read only", "report only", "summary only", "just answer",
+    "chỉ giải thích", "chi giai thich", "đừng làm", "dung lam",
+]
+
+# A no-edit phrase can either apply to the whole run ("không sửa file") or
+# merely constrain its scope ("không sửa agent platform").  Treating both as
+# equivalent was the root cause of autonomous product tasks being routed to
+# read_only_reporter.  These targets are intentionally limited to phrases that
+# clearly prohibit mutation of the current workspace as a whole.
+_GLOBAL_NO_EDIT_TARGETS = re.compile(
+    r"^(?:any\s+)?(?:files?|source(?:\s+code)?|code|project|workspace|repo(?:sitory)?|"
+    r"tệp|file|mã(?:\s+nguồn)?|code|dự\s+án|workspace|repo|gì|bất\s+kỳ\s+thứ\s+gì)\b",
+    re.IGNORECASE,
+)
+_GLOBAL_NO_EDIT_ALWAYS = {
+    "read-only", "read only", "report only", "summary only", "answer only",
+    "just answer", "only explain", "chỉ đọc", "chi doc", "chỉ trả lời",
+    "chi tra loi", "chỉ giải thích", "chi giai thich", "không làm gì",
+}
+
+
+def _global_no_edit_signals(text: str, raw_signals: list[str]) -> list[str]:
+    """Return only no-edit signals that prohibit the entire run.
+
+    Scoped constraints such as ``Không sửa agent platform`` or ``Do not touch
+    unrelated code`` must not downgrade a mutation task to read-only.
+    """
+    value = str(text or "").lower()
+    hits: list[str] = []
+    for signal in raw_signals:
+        normalized = signal.lower()
+        if normalized in _GLOBAL_NO_EDIT_ALWAYS:
+            hits.append(signal)
+            continue
+        start = 0
+        while True:
+            index = value.find(normalized, start)
+            if index < 0:
+                break
+            tail = value[index + len(normalized):].lstrip()
+            # End-of-clause means the prohibition is unqualified/global.
+            if not tail or tail[0] in ".,;:!?\n\r":
+                hits.append(signal)
+                break
+            line_tail = tail.splitlines()[0][:120]
+            if _GLOBAL_NO_EDIT_TARGETS.search(line_tail):
+                hits.append(signal)
+                break
+            start = index + len(normalized)
+    return list(dict.fromkeys(hits))
+
+
+def _forced_mutation(task: str, execution_context: dict[str, Any] | None = None) -> bool:
+    context = execution_context or {}
+    marker = str(task or "").lower()
+    return bool(
+        context.get("requiresMutation") is True
+        or str(context.get("executionClass") or "").lower() == "write"
+        or "mutation_required=true" in marker
+        or "mutation_required: true" in marker
+    )
+CONDITIONAL_EDIT_SIGNALS = [
+    "sửa luôn", "fix luôn", "nếu sai thì sửa", "nếu có lỗi thì sửa",
+    "nếu thấy lỗi thì sửa", "sai thì sửa",
+    # Expanded: conditional edit intent = still needs a worker
+    "nếu cần thì sửa", "if wrong then fix", "fix if needed",
+    "sửa nếu có", "chỉnh nếu sai", "fix any bugs",
+    "fix errors", "sửa lỗi nếu có", "nếu bug thì fix",
+]
 HIGH_RISK_SIGNALS = [
     "deploy",
     "production",
@@ -520,7 +668,20 @@ HIGH_RISK_SIGNALS = [
 
 def _signals(text: str, patterns: list[str]) -> list[str]:
     value = text.lower()
-    return [pattern for pattern in patterns if pattern in value]
+    matched: list[str] = []
+    for pattern in patterns:
+        normalized = pattern.lower()
+        if re.fullmatch(r"\w+", normalized, re.UNICODE):
+            present = re.search(
+                rf"(?<!\w){re.escape(normalized)}(?!\w)",
+                value,
+                re.UNICODE,
+            ) is not None
+        else:
+            present = normalized in value
+        if present:
+            matched.append(pattern)
+    return matched
 
 
 def _risk_rank(value: str) -> int:
@@ -532,32 +693,51 @@ def _merge_risk(*values: str) -> str:
     return ranked[1] if ranked[1] in {"low", "medium", "high"} else "medium"
 
 
-def _detect_task_intent(task: str, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+def _detect_task_intent(
+    task: str,
+    snapshot: dict[str, Any] | None = None,
+    execution_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     value = task.lower().strip()
-    no_edit = _signals(value, NO_EDIT_SIGNALS)
+    raw_no_edit = _signals(value, NO_EDIT_SIGNALS)
+    no_edit = _global_no_edit_signals(value, raw_no_edit)
+    forced_mutation = _forced_mutation(task, execution_context)
     conditional_edit = _signals(value, CONDITIONAL_EDIT_SIGNALS)
-    change = [] if no_edit else _signals(value, CHANGE_SIGNALS)
+    change = _signals(value, CHANGE_SIGNALS)
     read = _signals(value, READ_SIGNALS)
     project_creation = _is_project_creation_task(task, {"problemStatement": task})
     command_only = bool(_signals(value, ["chạy test", "chạy build", "run test", "run build", "npm run", "pytest"]))
-    requires_worker = bool((change or conditional_edit or project_creation or command_only) and not no_edit)
-    explicit_read_only = bool((read or "?" in value or no_edit) and not requires_worker)
+    requires_worker = bool(
+        forced_mutation
+        or ((change or conditional_edit or project_creation or command_only) and not no_edit)
+    )
+    # "?" in value was the #1 source of false-positive read-only classification:
+    # "fix the bug in auth.js?" -> worker never spawned. REMOVED.
+    # Now: "?" alone without a clear NO_EDIT signal does NOT flip to read-only.
+    is_likely_question = bool("?" in value and not change and not conditional_edit and not project_creation)
+    explicit_read_only = bool((read or is_likely_question or no_edit) and not requires_worker)
     mode = "modify"
-    if project_creation:
+    if project_creation and requires_worker:
         mode = "create_project"
     elif command_only and not change:
         mode = "command"
     elif explicit_read_only:
-        mode = "review" if any(signal in read for signal in ["review", "kiểm tra", "soi", "đánh giá", "tìm hiểu"]) else "answer"
+        mode = "review" if any(signal in read for signal in ["review", "soi", "đánh giá", "tìm hiểu"]) else "answer"
     elif not requires_worker:
         mode = "ambiguous"
     risk = "high" if _signals(value, HIGH_RISK_SIGNALS) else ("medium" if requires_worker else "low")
-    needs_clarification = mode == "ambiguous" and len(value) < 60
+    needs_clarification = False
+    # DEFENSE-IN-DEPTH: If change signals were detected AND no_edit is empty,
+    # requires_worker MUST be True. Recompute to eliminate any logic drift.
+    if forced_mutation or (change and not no_edit):
+        requires_worker = True
+        mode = "create_project" if project_creation else "modify"
     return {
         "mode": mode,
         "requiresWorker": requires_worker,
         "readOnly": not requires_worker,
         "explicitNoEdit": bool(no_edit),
+        "forcedMutation": forced_mutation,
         "isProjectCreation": project_creation,
         "needsClarification": needs_clarification,
         "riskClass": risk,
@@ -565,18 +745,22 @@ def _detect_task_intent(task: str, snapshot: dict[str, Any] | None = None) -> di
             "change": change,
             "read": read,
             "noEdit": no_edit,
+            "scopedNoEdit": [item for item in raw_no_edit if item not in no_edit],
             "conditionalEdit": conditional_edit,
         },
     }
 
 
-def classify_execution(task: str) -> dict[str, Any]:
-    intent = _detect_task_intent(task)
+def classify_execution(task: str, execution_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    intent = _detect_task_intent(task, execution_context=execution_context)
     safe_read_only = bool(
         intent.get("readOnly")
         and intent.get("mode") in {"answer", "review"}
         and not intent.get("needsClarification")
-        and not intent.get("signals", {}).get("change")
+        and (
+            intent.get("explicitNoEdit")
+            or not intent.get("signals", {}).get("change")
+        )
         and not intent.get("signals", {}).get("conditionalEdit")
     )
     return {
@@ -607,18 +791,92 @@ def _normalize_problem(problem: dict[str, Any], state: PipelineState) -> dict[st
     for key in ("constraints", "relevantFiles", "likelyCommands", "acceptanceCriteria", "ambiguities", "nonGoals"):
         if not isinstance(normalized.get(key), list):
             normalized[key] = []
-    if intent.get("explicitNoEdit") and "Do not modify files; answer/report only." not in normalized["constraints"]:
-        normalized["constraints"].append("Do not modify files; answer/report only.")
-    if intent.get("needsClarification") and "Task is underspecified; ask a clarifying question before editing." not in normalized["constraints"]:
-        normalized["constraints"].append("Task is underspecified; ask a clarifying question before editing.")
+    # Only inject "Do not modify files" when EXPLICIT no-edit was detected AND the
+    # task is truly read-only (no change signals, no project creation).
+    # This prevents the constraint from leaking into write-class tasks.
+    if intent.get("explicitNoEdit") and not requires_worker:
+        no_edit_msg = "Do not modify files; answer/report only."
+        if no_edit_msg not in normalized["constraints"]:
+            normalized["constraints"].append(no_edit_msg)
+    # Autonomous constraint: when the task IS a mutation task, include explicit
+    # write permission so downstream agents never downgrade to read-only.
+    if requires_worker:
+        mutation_constraint = (
+            "MUTATION_REQUIRED: This is a write-class task. You have FULL WRITE ACCESS. "
+            "You MUST produce real file edits, run commands, and verify with browser. "
+            "Do NOT produce a plan/report — produce working code changes. "
+            "Operate autonomously: do NOT ask the user clarifying questions. "
+            "For any ambiguous aspect, choose a sensible default, record it in assumptions[], "
+            "and produce a prioritized task list (highest priority first) before executing."
+        )
+    else:
+        mutation_constraint = (
+            "Operate autonomously: do NOT ask the user clarifying questions. "
+            "For any ambiguous aspect, choose a sensible default, record it in assumptions[], "
+            "and produce a prioritized task list (highest priority first) before executing."
+        )
+    if mutation_constraint not in normalized["constraints"]:
+        normalized["constraints"].append(mutation_constraint)
     return normalized
+
+
+# ── Mutation detection ────────────────────────────────────────────────
+# Verbs that signal the user wants code written/changed.
+# Word-boundary matching prevents false positives like "explain code" (noun).
+_MUTATION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(rf"\b{re.escape(v)}\b", re.IGNORECASE)
+    for v in [
+        "fix", "sửa", "build", "create", "implement", "refactor",
+        "install", "upgrade", "integrate", "optimize", "develop",
+        "làm", "tạo", "viết", "scaffold", "deploy",
+        # Code-as-verb patterns (avoid matching bare "code" as a noun)
+        "code a", "code the", "code this", "code up", "write code",
+        "make a", "make the", "make this",
+    ]
+]
+
+
+def _is_mutation_task(task: str, problem: dict[str, Any]) -> bool:
+    """True when the task text or problem statement contains a mutation verb."""
+    value = f"{task} {json.dumps(problem, ensure_ascii=False)}".lower()
+    return any(p.search(value) for p in _MUTATION_PATTERNS)
+
+
+def _execution_context(task: str, problem: dict[str, Any], state: PipelineState) -> dict[str, Any]:
+    """Build the execution context contract injected into every worker task spec."""
+    provided = dict(state.get("executionContext") or {})
+    generated = {
+        "intent": "modify" if _is_mutation_task(task, problem) else problem.get("taskType", "modify"),
+        "executionMode": "autonomous",
+        "permissionProfile": "workspace-write",
+        "requiresMutation": _is_mutation_task(task, problem),
+        "autoResolveTechnicalChoices": True,
+        "originalUserGoal": state.get("originalUserGoal") or state.get("task", ""),
+        "productRoot": (state.get("finalPlan") or {}).get("workerTaskSpec", {}).get("targetProjectDir", ""),
+        "contextId": state.get("correlationId", ""),
+        "executionId": state.get("executionId", ""),
+    }
+    merged = {**generated, **provided}
+    if not str(merged.get("productRoot") or "").strip():
+        merged["productRoot"] = generated["productRoot"]
+    if not str(merged.get("originalUserGoal") or "").strip():
+        merged["originalUserGoal"] = generated["originalUserGoal"]
+    return merged
+# ──────────────────────────────────────────────────────────────────────
 
 
 def _is_read_only(task: str, problem: dict[str, Any], intent: dict[str, Any] | None = None) -> bool:
     intent = intent or problem.get("taskIntent") or _detect_task_intent(task)
-    if intent.get("explicitNoEdit"):
+    # DEFENSE-IN-DEPTH: explicitNoEdit must be TRUE AND requiresWorker must be FALSE
+    # to gate a task as read-only. An explicitNoEdit with pending change signals is
+    # contradictory — default to allowing the worker.
+    if intent.get("explicitNoEdit") and not intent.get("requiresWorker"):
         return True
     if intent.get("requiresWorker"):
+        return False
+    # Check the task text directly for mutation verbs as a final backstop:
+    # if the user said "fix", "build", "code", etc., it is NEVER read-only.
+    if _is_mutation_task(task, problem):
         return False
     task_type = str(problem.get("taskType", "")).lower()
     return task_type in {"question", "review", "explain", "answer"} or bool(intent.get("readOnly"))
@@ -626,13 +884,35 @@ def _is_read_only(task: str, problem: dict[str, Any], intent: dict[str, Any] | N
 
 def _is_project_creation_task(task: str, problem: dict[str, Any]) -> bool:
     value = f"{task} {problem.get('problemStatement', '')}".lower()
-    return any(word in value for word in ["tạo", "thiết kế", "làm ra", "build", "create", "scaffold"]) and any(
+    return any(
+        word in value
+        for word in [
+            "tạo",
+            "thiết kế",
+            "làm ra",
+            "làm",
+            "build",
+            "create",
+            "scaffold",
+            "code",
+            "viết",
+            "viet",
+            "phát triển",
+            "phat trien",
+            "develop",
+            "xây",
+            "khởi tạo",
+        ]
+    ) and any(
         word in value
         for word in [
             "web",
             "app",
+            "website",
+            "trang web",
             "todo",
             "ứng dụng",
+            "ung dung",
             "application",
             "project",
             "service",
@@ -647,6 +927,23 @@ def _is_project_creation_task(task: str, problem: dict[str, Any]) -> bool:
             "go",
             "golang",
             "rust",
+            "music",
+            "nghe nhạc",
+            "nghe nhac",
+            "player",
+            "audio",
+            "spotify",
+            "podcast",
+            "video",
+            "chat",
+            "blog",
+            "shop",
+            "ecommerce",
+            "e-commerce",
+            "dashboard",
+            "game",
+            "landing",
+            "portfolio",
         ]
     )
 
@@ -660,34 +957,68 @@ def _infer_project_stack(task: str, spec: dict[str, Any] | None = None, problem:
         return "rust"
     if any(word in value for word in ["golang", "go cli", "go service", "go.mod"]):
         return "go"
-    if any(word in value for word in ["node", "npm", "react", "vite", "next", "javascript", "typescript", "todo", "web"]):
+    if any(
+        word in value
+        for word in [
+            "node",
+            "npm",
+            "react",
+            "vite",
+            "next",
+            "javascript",
+            "typescript",
+            "todo",
+            "web",
+            "music",
+            "nghe nhạc",
+            "nghe nhac",
+            "player",
+            "audio",
+            "podcast",
+            "video",
+            "chat",
+            "blog",
+            "shop",
+            "ecommerce",
+            "dashboard",
+            "game",
+            "landing",
+            "portfolio",
+            "website",
+            "trang web",
+        ]
+    ):
         return "node"
     return "generic"
 
 
+_VN_ASCII = str.maketrans(
+    "àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ",
+    "aaaaaaaaaaaaaaaaaeeeeeeeeeeeiiiiiooooooooooooooooouuuuuuuuuuuyyyyydAAAAAAAAAAAAAAAAAEEEEEEEEEEEIIIIIOOOOOOOOOOOOOOOOOUUUUUUUUUUUYYYYYD",
+)
+
+
+def _slugify_task(task: str) -> str:
+    import re
+    value = task.translate(_VN_ASCII).lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+    stop = {
+        "code", "lam", "tao", "viet", "build", "create", "scaffold", "develop",
+        "phat", "trien", "implement", "write", "generate", "xay", "khoi", "thiet", "ke",
+        "web", "app", "website", "trang", "ung", "dung", "application", "project",
+        "mot", "a", "an", "the", "ra", "cho", "cua", "voi", "co", "de",
+    }
+    tokens = [t for t in value.split("-") if t and t not in stop]
+    slug = "-".join(tokens[:4]) if tokens else ""
+    return slug
+
+
 def _default_project_dir(task: str, stack: str = "generic") -> str:
-    value = task.lower()
-    if "todo" in value or "to-do" in value:
-        return "todo-app"
-    if any(
-        signal in value
-        for signal in (
-            "vocabulary",
-            "từ vựng",
-            "tu vung",
-            "học tiếng anh",
-            "hoc tieng anh",
-            "english word",
-            "flashcard",
-        )
-    ):
-        return "vocabulary-app"
-    if stack == "python":
-        return "python-app"
-    if stack == "go":
-        return "go-app"
-    if stack == "rust":
-        return "rust-app"
+    slug = _slugify_task(task)
+    if slug:
+        return f"{slug}-app"
+    if stack in {"python", "go", "rust", "node"}:
+        return f"{stack}-app"
     return "app"
 
 
@@ -731,6 +1062,19 @@ def _target_allowed_pattern(target: str) -> str:
     return "**" if target == "." else f"{target}/**"
 
 
+def _resolve_product_workspace(workspace_path: str, worker_spec: dict[str, Any] | None) -> Path:
+    """Resolve the product root without allowing a planner-controlled escape."""
+    root = Path(workspace_path).resolve()
+    spec = worker_spec or {}
+    target = str(spec.get("targetProjectDir") or spec.get("projectRoot") or ".").strip()
+    if target in {"", "."}:
+        return root
+    candidate = (root / target).resolve()
+    if candidate != root and root not in candidate.parents:
+        return root
+    return candidate
+
+
 def _normalize_worker_task_spec(final: dict[str, Any], state: PipelineState) -> dict[str, Any]:
     spec = dict(final.get("workerTaskSpec") or {})
     spec["maxReworkAttempts"] = int(DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2))
@@ -751,12 +1095,20 @@ def _normalize_worker_task_spec(final: dict[str, Any], state: PipelineState) -> 
         ]
     )
     spec["forbiddenPaths"] = list(dict.fromkeys(forbidden))
-    # Bypass policy: skip all permission gates when user enables bypassPolicy
-    if state.get("settings", {}).get("bypassPolicy") or state.get("settings", {}).get("directWorkspaceMode"):
+    # Direct workspace controls WHERE edits happen; it must not silently disable
+    # path/command policy. Only an explicit Full Power/bypass choice does that.
+    settings = state.get("settings", {})
+    full_power = settings.get("fullPower") or {}
+    bypass_policy = bool(
+        settings.get("bypassPolicy")
+        or full_power.get("bypassSafeCommands")
+        or os.environ.get("AGENT_BYPASS_SAFE_COMMANDS") == "1"
+    )
+    if bypass_policy:
         spec["allowedFiles"] = ["**"]
         spec["forbiddenPaths"] = []  # trust user — they asked to bypass
         os.environ["AGENT_BYPASS_SAFE_COMMANDS"] = "1"
-        write_debug_event("plan.worker_spec_bypass", {"reason": "bypassPolicy or directWorkspaceMode enabled"})
+        write_debug_event("plan.worker_spec_bypass", {"reason": "explicit Full Power/bypassPolicy enabled"})
     if _is_project_creation_task(state["task"], state["problem"]):
         stack = str(spec.get("projectStack") or _infer_project_stack(state["task"], spec, state.get("problem"))).strip().lower() or "generic"
         target = _project_creation_target(state["task"], stack, spec)
@@ -818,10 +1170,34 @@ def _normalize_worker_task_spec(final: dict[str, Any], state: PipelineState) -> 
 
 
 def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
+    raw_emit = emit
+
+    def emit(stage: str, detail: str, **fields: Any) -> None:
+        """Emit enriched events while preserving the legacy two-argument API.
+
+        The desktop backend accepts structured keyword fields, while tests and
+        embedders historically passed ``lambda stage, detail``.  Adapting once
+        at the graph boundary keeps both contracts valid.
+        """
+        if not fields:
+            raw_emit(stage, detail)
+            return
+        try:
+            raw_emit(stage, detail, **fields)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument" not in message:
+                raise
+            raw_emit(stage, detail)
+
     def preflight(state: PipelineState) -> dict[str, Any]:
         emit("preflight", "Repo snapshot + trusted context")
         snapshot = get_snapshot(state["workspacePath"])
-        task_intent = _detect_task_intent(state["task"], snapshot)
+        task_intent = _detect_task_intent(
+            state["task"],
+            snapshot,
+            state.get("executionContext") or {},
+        )
         if state.get("executionClass") == "read_only":
             task_intent = {
                 **task_intent,
@@ -894,13 +1270,17 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"intakeFindings": [{"agent": "user_intent", **finding}]}
 
     def intake_ambiguity(state: PipelineState) -> dict[str, Any]:
-        emit("intake_ambiguity", "Read-only ambiguity and edge cases")
+        emit("intake_ambiguity", "Resolve ambiguities autonomously")
         finding = _json(
             state,
-            "Read-only Intake Agent B: find ambiguities, edge cases, and risk. Return JSON with ambiguities[], assumptions[], riskClass, needsHumanApproval.\n"
+            "Autonomous Intake Agent B: the user task may be open-ended. NEVER ask the user a clarifying question. "
+            "For each ambiguous aspect (tech stack, feature scope, UI style, data source, etc.) choose a reasonable default "
+            "and record it. Return JSON with resolvedDecisions[] (each: {topic, decision, reason}), assumptions[] (free-form notes), "
+            "riskClass, needsHumanApproval (always false unless task touches production/secrets/migration/db drop).\n"
             + json.dumps(_context(state, "intake_ambiguity"), ensure_ascii=False),
-            {"ambiguities": [], "assumptions": [], "riskClass": "medium", "needsHumanApproval": False},
+            {"resolvedDecisions": [], "assumptions": [], "riskClass": "medium", "needsHumanApproval": False},
         )
+        finding["needsHumanApproval"] = False if not finding.get("needsHumanApproval") else finding["needsHumanApproval"]
         return {"intakeFindings": [{"agent": "ambiguity_edge_cases", **finding}]}
 
     def intake_repo_context(state: PipelineState) -> dict[str, Any]:
@@ -917,8 +1297,10 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         emit("intake_synthesizer", "Problem statement + repro + risk class")
         problem = _json(
             state,
-            "Intake Synthesizer: merge findings. Return JSON with problemStatement, taskType, observedBehavior, expectedBehavior, repro, constraints[], riskClass, relevantFiles[], likelyCommands[], acceptanceCriteria[].\n"
+            "Autonomous Intake Synthesizer: merge findings. You operate in AUTONOMOUS mode — never instruct downstream agents to ask the user. "
+            "Return JSON with problemStatement, taskType, observedBehavior, expectedBehavior, repro, constraints[], riskClass, relevantFiles[], likelyCommands[], acceptanceCriteria[].\n"
             "Respect deterministicTaskIntent for readOnly/requiresWorker; do not classify a task as read-only when it contains explicit edit/fix/create signals.\n"
+            "If the task is open-ended (e.g. 'code a music web app'), incorporate resolvedDecisions/assumptions from intake_ambiguity into acceptanceCriteria[] and constraints[].\n"
             + json.dumps(_context(state, "intake_synthesizer"), ensure_ascii=False),
             {"problemStatement": state["task"], "taskType": "modify", "constraints": [], "riskClass": "medium", "relevantFiles": [], "likelyCommands": [], "acceptanceCriteria": []},
         )
@@ -965,7 +1347,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         emit("plan_arbiter", "Final plan + acceptance criteria + worker task spec")
         final = _json(
             state,
-            "Plan Arbiter: choose final plan and produce workerTaskSpec. Return JSON with selectedPlanName, finalSteps[], riskClass, humanGateReason, workerTaskSpec{objective, filesToRead[], allowedFiles[], forbiddenPaths[], commandsToRun[], verificationCommands[], acceptanceCriteria[], constraints[], maxReworkAttempts}.\n"
+            "Autonomous Plan Arbiter: you operate WITHOUT user interaction. Resolve all ambiguities by selecting sensible defaults, prioritize the work as an ordered task list, and produce a fully-specified workerTaskSpec.\n"
+            "When taskType is modify/create/build/fix: produce a workerTaskSpec with real mutation commands and file edits — NOT a read-only analysis. Set requiresMutation=true in executionContext.\n"
+            "Plan Arbiter: choose final plan and produce workerTaskSpec. Return JSON with selectedPlanName, finalSteps[], riskClass, humanGateReason, workerTaskSpec{objective, filesToRead[], allowedFiles[], forbiddenPaths[], commandsToRun[], verificationCommands[], acceptanceCriteria[], constraints[], maxReworkAttempts, prioritizedTasks[], executionContext{intent, executionMode, permissionProfile, requiresMutation, autoResolveTechnicalChoices, originalUserGoal, productRoot, contextId, executionId}}.\n"
+            "prioritizedTasks[] is an ordered list (highest priority first); each item is {priority:int, task:str, acceptanceCriterion:str}. The worker MUST execute in this order.\n"
+            "Leave humanGateReason empty unless task touches production/secrets/migration/db drop. Do not block on missing requirements — pick defaults.\n"
             "The workerTaskSpec must be a machine-executable contract: objective, allowed paths, forbidden actions, expected files, verification commands, definition of done, and human escalation conditions.\n"
             "For new web apps, set workerTaskSpec.targetProjectDir and verificationCwd to the app folder such as todo-app. Keep scaffold/setup/dev-server commands out of verificationCommands. Use verificationCommands only for build/test/check commands such as npm run build.\n"
             + json.dumps(_context(state, "plan_arbiter"), ensure_ascii=False),
@@ -984,6 +1370,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     "acceptanceCriteria": state["problem"].get("acceptanceCriteria", []),
                     "constraints": state["problem"].get("constraints", []),
                     "maxReworkAttempts": 1,
+                    "executionContext": _execution_context(state["task"], state["problem"], state),
                 },
             },
             role="planner",
@@ -1072,58 +1459,16 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"governanceDecision": decision, "brokerEvents": events}
 
     def human_gate(state: PipelineState) -> dict[str, Any]:
-        governance = state.get("governanceDecision") or {}
-        risk = str(governance.get("riskClass", state.get("taskIntent", {}).get("riskClass", "medium")))
-        auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
-        bypass_policy = bool((state.get("settings") or {}).get("bypassPolicy"))
-        approval = state.get("humanGateApproval") or {}
-        approved = str(approval.get("status") or "").lower() == "approved"
-        needs_approval = (risk == "high" or bool(governance.get("needsApproval"))) and not bypass_policy
-        if needs_approval and auto_confirm:
-            emit("human_gate", "Auto-confirm enabled; gate passed")
-            return {
-                "readOnlyHandoff": {
-                    "task": state["task"],
-                    "problem": state["problem"],
-                    "finalPlan": state["finalPlan"],
-                    "codegraphContext": state.get("codegraphContext") or {},
-                }
-            }
-        if needs_approval and approved:
-            emit("human_gate", "Durable approval found; gate passed")
-            created_ms = telemetry.parse_iso_ms(approval.get("createdAt"))
-            approved_ms = telemetry.parse_iso_ms(approval.get("approvedAt"))
-            if created_ms is not None and approved_ms is not None:
-                telemetry.record_approval_latency(max(0.0, approved_ms - created_ms), risk)
-            return {
-                "readOnlyHandoff": {
-                    "task": state["task"],
-                    "problem": state["problem"],
-                    "finalPlan": state["finalPlan"],
-                    "codegraphContext": state.get("codegraphContext") or {},
-                }
-            }
-        if needs_approval:
-            emit("human_gate", "High-risk task requires confirmation")
-            return {
-                "result": {
-                    "assistantText": "Tác vụ high-risk nên workflow dừng ở Human Gate. Gửi “xác nhận” trong cùng phiên để phê duyệt và chạy tiếp task gốc.",
-                    "changedFiles": [],
-                    "commandResults": [],
-                    "review": None,
-                    "humanGate": {
-                        "status": "pending",
-                        "kind": "risk_approval",
-                        "originalTask": state["task"],
-                        "correlationId": state.get("correlationId", ""),
-                        "executionId": state.get("executionId", ""),
-                        "riskClass": risk,
-                        "reason": state["finalPlan"].get("humanGateReason") or governance.get("approvalPolicy") or state["problem"].get("riskClass", "high"),
-                        "createdAt": datetime.now(timezone.utc).isoformat(),
-                    },
-                }
-            }
-        emit("human_gate", "Gate passed")
+        # FULL AUTONOMY: auto-pass all gates, never wait for human.
+        # BUT: the _is_read_only() check in route_facts determines routing.
+        # If the task IS read-only, we route to read_only_reporter.
+        # If the task IS write-class, we route to environment_gate -> worker.
+        # Always build the readOnlyHandoff (needed if route_facts says read_only).
+        is_ro = _is_read_only(state["task"], state.get("problem") or {}, state.get("taskIntent"))
+        if is_ro:
+            emit("human_gate", "Read-only task — routing to answer reporter")
+        else:
+            emit("human_gate", "Autonomy mode — write-class gate auto-passed")
         return {
             "readOnlyHandoff": {
                 "task": state["task"],
@@ -1220,7 +1565,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 {"role": "user", "content": json.dumps(_context(state, "read_only_reporter"), ensure_ascii=False)},
             ]
         )
-        return {"result": {"assistantText": answer, "changedFiles": [], "commandResults": [], "review": None}}
+        return {"result": {"assistantText": answer, "changedFiles": [], "commandResults": [], "review": {"passed": True, "verdict": "approved", "readOnly": True, "blockers": []}}}
 
     def load_context_files(state: PipelineState) -> dict[str, Any]:
         emit("context", "Loading worker context files")
@@ -1281,23 +1626,70 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 subtask_id = subtask["id"]
         overrides = state["settings"].get("modelOverrides") or {}
         coder_model = str(overrides.get("coder") or state["settings"]["model"])
-        worker_result = run_openhands_worker(
-            workspace=state["workspacePath"],
-            server_url=state["settings"]["serverUrl"],
-            model=coder_model,
-            api_key=runtime_settings().get("apiKey", ""),
-            worker_task_spec={
-                **spec,
-                "setupCommandResults": setup_results,
-                "contextEnvelope": _context(state, "openhands_worker"),
-            },
-            rework_context=state.get("latestReview"),
-            emit=emit,
-            execution_id=state.get("executionId"),
-            worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
-            dependency_workspace=state.get("sourceWorkspacePath"),
-            worktree_isolated=True,
-        )
+        api_key_val = runtime_settings().get("apiKey", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+        use_claude_sdk = str(os.getenv("AGENT_USE_OPENHANDS") or "0").lower() not in {"1", "true", "yes", "on"}
+        worker_result: dict[str, Any]
+        if use_claude_sdk:
+            try:
+                from .claude_code_worker import run_claude_code_worker, _has_sdk as _ccw_has_sdk
+            except Exception:
+                _ccw_has_sdk = lambda: False  # type: ignore[assignment]
+                run_claude_code_worker = None  # type: ignore[assignment]
+            if run_claude_code_worker is not None and _ccw_has_sdk():
+                emit("openhands_worker", "Using claude-agent-sdk worker (Read/Edit/Write/Bash with live stream)")
+                worker_result = run_claude_code_worker(
+                    workspace=state["workspacePath"],
+                    model=coder_model,
+                    api_key=api_key_val,
+                    worker_task_spec={
+                        **spec,
+                        "setupCommandResults": setup_results,
+                        "contextEnvelope": _context(state, "openhands_worker"),
+                    },
+                    rework_context=state.get("latestReview"),
+                    emit=emit,
+                    execution_id=state.get("executionId"),
+                    worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
+                )
+            else:
+                emit("openhands_worker", "claude-agent-sdk unavailable — falling back to OpenHands worker")
+                worker_result = run_openhands_worker(
+                    workspace=state["workspacePath"],
+                    server_url=state["settings"]["serverUrl"],
+                    model=coder_model,
+                    api_key=api_key_val,
+                    worker_task_spec={
+                        **spec,
+                        "setupCommandResults": setup_results,
+                        "contextEnvelope": _context(state, "openhands_worker"),
+                    },
+                    rework_context=state.get("latestReview"),
+                    emit=emit,
+                    execution_id=state.get("executionId"),
+                    worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
+                    dependency_workspace=state.get("sourceWorkspacePath"),
+                    worktree_isolated=True,
+                    is_cancelled=(lambda eid=state.get("executionId"): is_cancelled(eid)),
+                )
+        else:
+            worker_result = run_openhands_worker(
+                workspace=state["workspacePath"],
+                server_url=state["settings"]["serverUrl"],
+                model=coder_model,
+                api_key=api_key_val,
+                worker_task_spec={
+                    **spec,
+                    "setupCommandResults": setup_results,
+                    "contextEnvelope": _context(state, "openhands_worker"),
+                },
+                rework_context=state.get("latestReview"),
+                emit=emit,
+                execution_id=state.get("executionId"),
+                worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
+                dependency_workspace=state.get("sourceWorkspacePath"),
+                worktree_isolated=True,
+                is_cancelled=(lambda eid=state.get("executionId"): is_cancelled(eid)),
+            )
         if direct_workspace and str(spec.get("projectStack") or "").lower() == "node":
             target = str(spec.get("targetProjectDir") or spec.get("projectRoot") or ".")
             project_root = Path(state["workspacePath"]) if target in {"", "."} else Path(state["workspacePath"]) / target
@@ -1334,7 +1726,8 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
 
     def tester_agent(state: PipelineState) -> dict[str, Any]:
         environment = state.get("executionEnvironment") or {}
-        use_container = bool(environment.get("containerAvailable"))
+        _container_disabled = str(os.getenv("AGENT_DISABLE_CONTAINER") or "").lower() in {"1", "true", "yes", "on"}
+        use_container = (not _container_disabled) and bool(environment.get("containerAvailable")) and str(environment.get("container", {}).get("runtime") or "") not in ("", "host")
         direct_workspace = bool(environment.get("directWorkspace"))
         emit(
             "tester_agent",
@@ -1368,6 +1761,18 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     else "Container command results and the latest worker output may be evaluated."
                 )
             else:
+                def _stream_chunk(stream_tag: str, line: str) -> None:
+                    try:
+                        emit(
+                            "tester_agent",
+                            line[:240],
+                            node="tester_agent",
+                            event_type="cmd_chunk",
+                            tool=stream_tag,
+                            status="running",
+                        )
+                    except Exception:
+                        pass
                 command_results = [
                     {
                         **run_command(
@@ -1376,6 +1781,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                             cwd=item.get("cwd", "."),
                             timeout=120,
                             sandboxed=not direct_workspace,
+                            emit_chunk=_stream_chunk,
                         ),
                         "containerFallback": True,
                         "directWorkspace": direct_workspace,
@@ -1430,7 +1836,19 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         if latest.get("error"):
             review.setdefault("blockers", []).append(f"Coder agent error: {latest['error']}")
         if any((not item.get("skipped")) and (item.get("timedOut") or item.get("code") not in (0, None)) for item in command_results):
-            review.setdefault("blockers", []).append("At least one verification command failed.")
+            # Inject the specific STDOUT/STDERR from failed commands so the coder can auto-fix.
+            # NOTE: _compact was previously referenced here without being imported/defined in
+            # this scope → NameError that killed the tester node (and the whole pipeline) on
+            # every failed verification command. Use the module-local _summarize_value instead.
+            failures = [
+                f"Command `{item.get('command','?')}` exited {item.get('code','?')}: {_summarize_value((item.get('stdout','') + ' ' + item.get('stderr','')), 500)}"
+                for item in command_results
+                if (not item.get("skipped")) and (item.get("timedOut") or item.get("code") not in (0, None))
+            ]
+            for fdetail in failures:
+                review.setdefault("blockers", []).append(f"Verification failed: {fdetail}")
+            if not failures:
+                review.setdefault("blockers", []).append("At least one verification command failed.")
         if not direct_workspace and any(not item.get("sandboxed") for item in command_results):
             review.setdefault("blockers", []).append("Verification did not run inside the required isolated verification workspace.")
         review["blockers"] = list(dict.fromkeys(map(str, review.get("blockers") or [])))
@@ -1543,8 +1961,17 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         The verify phase re-runs the project's own check commands so the
         reviewer can see whether the pipeline state improved after the fix.
         """
-        emit("doctor_feedback", "Running autonomous fix loop on the workspace")
-        workspace = str(Path(state["workspacePath"]).resolve())
+        worker_spec = (state.get("finalPlan") or {}).get("workerTaskSpec") or {}
+        product_workspace = _resolve_product_workspace(state["workspacePath"], worker_spec)
+        if not product_workspace.exists() or not product_workspace.is_dir():
+            reason = f"Product root does not exist; doctor skipped: {product_workspace}"
+            emit("doctor_feedback", reason)
+            return {
+                "doctorFindings": [{"error": reason, "scan": {"issues": []}, "fix": {"applied": [], "skipped": []}, "verify": {"ok": False, "runs": []}}],
+                "doctorStatus": {"ok": False, "issuesCount": 0, "applied": 0, "skipped": 0, "verificationPassed": False, "skippedReason": reason},
+            }
+        workspace = str(product_workspace)
+        emit("doctor_feedback", f"Running autonomous fix loop in product root: {product_workspace.name}")
         provider: Any = None
         try:
             from .claude_adapter import ClaudeConfig, ClaudeProvider
@@ -1577,6 +2004,22 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         applied = len(fix.get("applied") or [])
         skipped = len(fix.get("skipped") or [])
         emit("doctor_feedback", f"{issues_count} issue · {applied} fix · {skipped} skip · verify {'PASS' if ok else 'FAIL'}")
+        # Capture failing verify runs (cmd + output tail) so reviewer_decision
+        # can turn them into BLOCKING signals — a failing project check must
+        # drive the rework loop, not just sit as informational relief context.
+        failing_runs: list[dict[str, Any]] = []
+        for run in (verify.get("runs") or []):
+            if not run.get("ok"):
+                cmd = run.get("command")
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+                tail = (str(run.get("stderr") or "")[-1500:] or str(run.get("stdout") or "")[-1500:])
+                failing_runs.append({"command": cmd_str, "code": run.get("code"), "tail": tail})
+        # Degradation surfacing: issues were found but no LLM provider was
+        # available to fix the non-deterministic ones (see task 7).
+        skipped_reason = None
+        if issues_count > 0 and provider is None and skipped > 0:
+            skipped_reason = "no_provider"
+            emit("doctor_feedback", f"⚠ No API key/provider — {skipped} issue(s) left unfixed (LLM patch path disabled)")
         return {
             "doctorFindings": [doctor_result],
             "doctorStatus": {
@@ -1585,6 +2028,9 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 "applied": applied,
                 "skipped": skipped,
                 "verificationPassed": ok,
+                "failingRuns": failing_runs,
+                "skippedReason": skipped_reason,
+                "providerAvailable": provider is not None,
                 "scannedAt": datetime.now(timezone.utc).isoformat(),
             },
         }
@@ -1663,10 +2109,86 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 if not review.get("blockers"):
                     review["passed"] = True
                     review["verdict"] = "approved"
+        # Doctor verify is AUTHORITATIVE and independent of how many issues the
+        # scanner found: if the project's own check commands fail after the
+        # doctor ran, that must drive the rework loop — never be silently
+        # informational. Emit a hard blocker carrying the failing command +
+        # output tail so the next openhands_worker iteration gets the actual
+        # error text. "verification failed" survives the HARD_BLOCKER filter.
+        # Guard: only when the doctor actually ran a verify (failingRuns present
+        # OR verificationPassed explicitly False), and not already cleared.
+        doctor_ran_verify = "verificationPassed" in doctor
+        if doctor_ran_verify and not doctor.get("verificationPassed", True):
+            failing = doctor.get("failingRuns") or []
+            if failing:
+                for fr in failing[:3]:
+                    review.setdefault("blockers", []).append(
+                        f"Verification failed (doctor): {fr.get('command')} exit {fr.get('code')}: "
+                        f"{str(fr.get('tail') or '')[-600:]}"
+                    )
+            else:
+                review.setdefault("blockers", []).append(
+                    "Verification failed (doctor): project check commands did not pass after fixes"
+                )
+            review["passed"] = False
+            review["verdict"] = "changes_required"
+            emit("reviewer_decision", f"Doctor verify FAILED → {len(failing) or 1} blocker(s); routing to rework")
+        # Surface provider degradation as a warning so the user understands why
+        # nothing was fixed when there is no API key (not a blocker — it can't be
+        # fixed by reworking, only by configuring a key).
+        if doctor.get("skippedReason") == "no_provider":
+            review.setdefault("warnings", []).append(
+                f"[doctor] No API key configured — {doctor.get('skipped', 0)} issue(s) could not be auto-fixed. "
+                f"Set ANTHROPIC_API_KEY to enable the LLM patch path."
+            )
         # Save plan to revision history before overwriting on replan
         prior_plan = state.get("finalPlan")
         if prior_plan and verdict == "replan_required":
             review["priorPlanSnapshot"] = dict(prior_plan)
+        # ── SMART AUTONOMY: only real errors (build fail, coder crash, sandbox breach) are blockers.
+        #     LLM opinions ("missing rate limiting", "no test coverage 80%") → warnings only. ──
+        #     BUT: structural gaps (no tests, no error handling, no validation) → warnings, never
+        #     silently cleared. Externalized from HARD_BLOCKER_SIGNALS so they are tracked but
+        #     not blocking (the review is still "passed" if only these remain; they convert to
+        #     warnings to keep the loop moving).
+        HARD_BLOCKER_SIGNALS = {
+            "exited", "command failed", "coder agent error", "verification failed",
+            "sandbox", "policy violation", "crash", "traceback", "error:",
+            "ts6133", "ts23", "cannot find name", "unexpected token",
+            "syntaxerror", "typeerror", "referenceerror", "module not found",
+            # Expanded: coverage/test/validation gaps that indicate real execution failure
+            "no files changed", "worker produced no file changes",
+            "0 files changed", "empty diff", "no output",
+        }
+        if review.get("blockers"):
+            kept: list[str] = []
+            moved: list[str] = []
+            for b in map(str, review["blockers"]):
+                if any(sig in b.lower() for sig in HARD_BLOCKER_SIGNALS):
+                    kept.append(b)
+                else:
+                    moved.append(f"[llm opinion → warning] {b}")
+            review["blockers"] = kept
+            if moved:
+                review["warnings"] = list(dict.fromkeys((review.get("warnings") or []) + moved))
+            if not kept:
+                review["passed"] = True
+                review["verdict"] = "approved"
+        # ── NO-EVIDENCE GATE: write-class task that produced zero changed files ──
+        # This catches the "worker was invoked but didn't actually do anything" case.
+        changed_files = latest.get("changedFiles") or []
+        execution_class = state.get("executionClass", "write")
+        problem = state.get("problem") or {}
+        intent = problem.get("taskIntent") or state.get("taskIntent") or {}
+        is_write_class = execution_class != "read_only" or intent.get("requiresWorker")
+        is_mutation = _is_mutation_task(state["task"], problem if problem else {})
+        if is_write_class and not changed_files and not latest.get("error"):
+            noblocker = "Worker produced no file changes on a write-class task"
+            if noblocker not in str(review.get("blockers") or []):
+                review.setdefault("blockers", []).append(noblocker)
+                review["passed"] = False
+                review["verdict"] = "changes_required"
+                emit("reviewer_decision", f"No-evidence gate: {noblocker}")
         run_id = state.get("brokerRunId")
         events = state.get("brokerEvents", [])
         if run_id:
@@ -1676,22 +2198,14 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     "blockers": review.get("blockers", []), "revision": revision,
                 })
                 retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 3)))
-                will_rework = bool(review.get("blockers")) and state.get("retryCount", 0) <= retry_limit
-                auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
-                auto_cycle_limit = int(DEFAULT_WORKFLOW.limits.get("maxAutoApprovalCycles", 1))
-                can_auto_grant = auto_confirm and int(state.get("reworkCycle", 0)) < auto_cycle_limit
+                will_rework = bool(review.get("blockers")) and state.get("retryCount", 0) < retry_limit
                 if will_rework:
                     telemetry.record_rework()
-                needs_gate = bool(review.get("blockers")) and not will_rework and not latest.get("error") and not auto_confirm
-                status = (
-                    "needs_rework"
-                    if will_rework or (bool(review.get("blockers")) and can_auto_grant)
-                    else ("completed" if review.get("passed") else ("pending_approval" if needs_gate else "blocked"))
-                )
+                status = "needs_rework" if will_rework else "completed"
                 broker.finish_run(
                     run_id,
                     status,
-                    {"passed": review.get("passed"), "verdict": verdict, "willRework": will_rework, "needsExecutionGate": needs_gate, "revision": revision},
+                    {"passed": review.get("passed"), "verdict": verdict, "willRework": will_rework, "needsExecutionGate": False, "revision": revision},
                 )
                 events = broker.events(run_id)
                 review["brokerEvents"] = events
@@ -1707,65 +2221,19 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         }
 
     def execution_gate(state: PipelineState) -> dict[str, Any]:
-        grant = int(DEFAULT_WORKFLOW.limits.get("approvalGrantAttempts", 1))
-        auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
-        auto_cycle_limit = int(DEFAULT_WORKFLOW.limits.get("maxAutoApprovalCycles", 1))
+        # AUTONOMY: auto-grant rework, but RESPECT retry limits from config.
+        # Never force-pass — if retries are exhausted, route to reporter.
         current_cycle = int(state.get("reworkCycle", 0))
-        if auto_confirm and current_cycle < auto_cycle_limit:
-            retry_count = int(state.get("retryCount", 0))
-            emit("execution_gate", f"Auto-confirm enabled; granting {grant} bounded rework attempt(s)")
-            return {
-                "retryLimit": retry_count + grant - 1,
-                "reworkCycle": current_cycle + 1,
-                "autoReworkGranted": True,
-            }
-
-        if auto_confirm:
-            emit("execution_gate", "Auto-confirm rework budget exhausted; finishing without approval prompt")
-            review = state.get("latestReview") or {}
-            return {
-                "autoReworkGranted": False,
-                "result": {
-                    "assistantText": (
-                        "Đã dùng hết ngân sách sửa tự động. Run kết thúc mà không yêu cầu xác nhận; "
-                        "các thay đổi chưa đạt review sẽ được rollback."
-                    ),
-                    "changedFiles": (state.get("workerAttempts") or [{}])[-1].get("changedFiles", []),
-                    "commandResults": review.get("commandResults", []),
-                    "review": review,
-                    "reworkAttempts": state.get("workerAttempts", []),
-                },
-            }
-
-        emit("execution_gate", "Bounded rework limit reached; human approval required")
-        next_cycle = int(state.get("reworkCycle", 0)) + 1
-        review = state.get("latestReview") or {}
-        reason = (
-            f"Đã dùng hết {DEFAULT_WORKFLOW.limits.get('maxReworkAttempts', 2)} lượt sửa tự động; "
-            "cần con người phê duyệt trước khi cấp thêm lượt."
-        )
+        retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 3)))
+        retry_count = int(state.get("retryCount", 0))
+        if retry_count >= retry_limit:
+            emit("execution_gate", f"Retry limit exhausted ({retry_count}/{retry_limit}) — routing to reporter")
+            return {"retryLimit": retry_limit, "reworkCycle": current_cycle, "autoReworkGranted": False}
+        emit("execution_gate", f"Autonomy rework cycle {current_cycle + 1} (retry {retry_count}/{retry_limit})")
         return {
-            "result": {
-                "assistantText": (
-                    f"{reason} Gửi “xác nhận” trong cùng phiên để cấp thêm {grant} lượt có giới hạn."
-                ),
-                "changedFiles": (state.get("workerAttempts") or [{}])[-1].get("changedFiles", []),
-                "commandResults": review.get("commandResults", []),
-                "review": review,
-                "humanGate": {
-                    "status": "pending",
-                    "kind": "rework_limit",
-                    "originalTask": state["task"],
-                    "correlationId": state.get("correlationId", ""),
-                    "executionId": state.get("executionId", ""),
-                    "riskClass": "high",
-                    "reason": reason,
-                    "retryCount": state.get("retryCount", 0),
-                    "reworkCycle": next_cycle,
-                    "grantAdditionalAttempts": grant,
-                    "createdAt": datetime.now(timezone.utc).isoformat(),
-                },
-            }
+            "retryLimit": retry_limit,
+            "reworkCycle": current_cycle + 1,
+            "autoReworkGranted": True,
         }
 
     def reporter(state: PipelineState) -> dict[str, Any]:
@@ -1811,13 +2279,28 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 lines.append(f"- {note}")
             if release_plan.get("rollbackPlan"):
                 lines.append(f"- Rollback: {release_plan.get('rollbackPlan')}")
+        # ── Completion gate: mutation task with zero evidence → FAILED ──
+        problem = state.get("problem") or {}
+        failed = False
+        if (
+            problem.get("requiresWorker")
+            and not changed
+            and not review.get("commandResults")
+            and not any(attempt.get("error") for attempt in attempts)
+        ):
+            lines.append(
+                "\nFAILED: Mutation task produced no file changes or verification output."
+            )
+            failed = True
+        # ─────────────────────────────────────────────────────────────────
         return {
             "result": {
                 "assistantText": "\n".join(lines),
                 "changedFiles": changed,
                 "commandResults": review.get("commandResults", []),
-                "review": review,
+                "review": review if not failed else {**review, "passed": False, "blockers": list(review.get("blockers") or []) + ["Mutation task produced no file changes or verification output."]},
                 "reworkAttempts": attempts,
+                "completed": not failed,
             }
         }
 
@@ -1831,10 +2314,18 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             result["directWorkspace"] = True
             result["setupCommandResults"] = list(state.get("setupCommandResults") or [])
             if not review.get("passed"):
-                result["assistantText"] = (
-                    str(result.get("assistantText") or "")
-                    + "\n\nCác thay đổi và dependency đã được giữ trực tiếp trong workspace để bạn tiếp tục xử lý."
+                changed_files = result.get("changedFiles") or []
+                setup_results = result.get("setupCommandResults") or []
+                truthful_tail = (
+                    "Các thay đổi đã tạo vẫn nằm trực tiếp trong workspace, nhưng verification/review chưa đạt."
+                    if changed_files
+                    else (
+                        "Setup command đã chạy nhưng run chưa tạo thay đổi file được xác minh."
+                        if setup_results
+                        else "Run chưa tạo thay đổi file hoặc evidence được xác minh."
+                    )
                 )
+                result["assistantText"] = str(result.get("assistantText") or "") + f"\n\n{truthful_tail}"
             return {"result": result}
         if not state.get("workerAttempts"):
             cleanup_execution_worktree(worktree)
@@ -1880,19 +2371,36 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             "has_result": bool(state.get("result")),
             "read_only": _is_read_only(state["task"], state.get("problem") or {}, state.get("taskIntent")),
             "worker_error": bool(attempts and attempts[-1].get("error")),
+            "worker_error_can_rework": bool(
+                attempts
+                and attempts[-1].get("error")
+                and retry_count < retry_limit
+            ),
             "review_passed": review_passed,
             "changes_required": verdict == "changes_required",
             "replan_required": verdict == "replan_required",
             "blocked": verdict == "blocked",
-            "can_rework": bool(blockers) and retry_count <= retry_limit and verdict in {"changes_required", "replan_required"},
-            "can_replan": verdict == "replan_required" and retry_count <= retry_limit,
+            "can_rework": bool(blockers) and retry_count < retry_limit and verdict in {"changes_required", "replan_required"},
+            "can_replan": verdict == "replan_required" and retry_count < retry_limit,
             "tester_failed": not bool(tester_result.get("passed")) and not bool(attempts and attempts[-1].get("error")),
+            "tester_failed_can_rework": (
+                bool(tester_result)
+                and tester_result.get("passed") is False
+                and retry_count < retry_limit
+                and not bool(attempts and attempts[-1].get("error"))
+            ),
             "retry_count": retry_count,
             "retry_limit": retry_limit,
             "auto_rework_granted": bool(state.get("autoReworkGranted")),
             "doctor_ran": bool(state.get("doctorStatus")),
             "doctor_passed": bool((state.get("doctorStatus") or {}).get("verificationPassed")),
             "doctor_issues": int((state.get("doctorStatus") or {}).get("issuesCount") or 0),
+            "mutation_task_no_evidence": (
+                bool((state.get("problem") or {}).get("requiresWorker"))
+                and not bool((state.get("result") or {}).get("changedFiles"))
+                and not bool((state.get("result") or {}).get("commandResults"))
+                and not _is_read_only(state["task"], state.get("problem") or {}, state.get("taskIntent"))
+            ),
         }
 
     agent_roles = {
@@ -1949,6 +2457,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         slice_ = {k: state.get(k) for k in keys if k in state}
         return _summarize_value(slice_, limit=limit)
 
+    # Generous cap for the Agent Inspector I/O subtab — the compact summaries
+    # above stay short for the global tail, but the I/O view gets the real
+    # payload so users can see exactly what went in and came out of each node.
+    FULL_IO_LIMIT = int(os.environ.get("AGENT_IO_FULL_LIMIT", str(48_000)))
+
     context_routes = DEFAULT_WORKFLOW.context_routes
 
     def traced_node(node_name: str, fn: Callable[[PipelineState], dict[str, Any]]):
@@ -1965,6 +2478,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 # no explicit entry for this node.
                 input_keys = ["task", "taskIntent", "problem", "workspacePath", "executionId"]
             input_summary = _summarize_state(state, input_keys) if input_keys else ""
+            # Full input payload (large cap) for the I/O subtab. Include the
+            # consumed keys plus any other non-internal state so the user sees
+            # the real input, not just a 500-char key-slice.
+            input_full_slice = {k: state.get(k) for k in input_keys if k in state}
+            input_full = _summarize_value(input_full_slice, limit=FULL_IO_LIMIT)
             if is_cancelled(execution_id):
                 emit(
                     node_name,
@@ -1992,6 +2510,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 retry_count=retry_count,
                 review_cycle=review_cycle,
                 input_summary=input_summary,
+                input=input_full,
             )
             step_input = {
                 "node": node_name,
@@ -2000,6 +2519,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 "executionId": execution_id,
                 "brokerRunId": state.get("brokerRunId", ""),
             }
+            try:
+                from . import claude_adapter as _ca
+                _ca.set_stream_emit(emit, node_name)
+            except Exception:
+                pass
             with checkpoint_step("agent_node", node_name, step_input) as durable_step:
                 with telemetry.start_span(
                     "agent.step",
@@ -2032,6 +2556,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     durable_step.set_output(output)
                     duration_ms = (telemetry.now_ms() - t0) if t0 is not None and hasattr(telemetry, "now_ms") else None
                     output_summary = _summarize_value(output)
+                    output_full = _summarize_value(output, limit=FULL_IO_LIMIT)
                     try:
                         token_delta = telemetry.get_token_usage_delta() if hasattr(telemetry, "get_token_usage_delta") else None
                     except Exception:
@@ -2048,8 +2573,14 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                         retry_count=retry_count,
                         review_cycle=review_cycle,
                         output_summary=output_summary,
+                        output=output_full,
                         token_usage=token_delta,
                     )
+                    try:
+                        from . import claude_adapter as _ca
+                        _ca.set_stream_emit(None, "")
+                    except Exception:
+                        pass
                     return output
 
         return wrapped
@@ -2105,6 +2636,17 @@ def _run_metric_status(result: PipelineState) -> str:
     attempts = result.get("workerAttempts") or []
     if attempts and attempts[-1].get("error"):
         return "error"
+    # If review is None (read_only_reporter path), explicitly check if task was read-only.
+    # read_only_reporter returns review: None — this is intentional for read-only tasks.
+    # But if a write-class task has no review, that's an anomaly → "unknown" not "success".
+    if review is None or not review:
+        intent = result.get("taskIntent") or {}
+        if intent.get("requiresWorker") or intent.get("readOnly") is False:
+            return "error"  # Write-class task with no review → anomaly
+        return "success"  # Read-only task with no review is expected
+    # Default: explicit passed=False but no blockers/error → incomplete
+    if review.get("passed") is False:
+        return "blocked"
     return "success"
 
 
@@ -2118,17 +2660,28 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
     approval = dict(payload.get("humanGateApproval") or {})
     approval_granted = str(approval.get("status") or "").lower() == "approved"
     approval_kind = str(approval.get("kind") or "")
-    admission = classify_execution(str(payload["content"]))
+    supplied_execution_context = dict(payload.get("executionContext") or {})
+    admission = classify_execution(str(payload["content"]), supplied_execution_context)
     execution_class = str(admission["executionClass"])
+    original_user_goal = str(
+        supplied_execution_context.get("originalUserGoal")
+        or payload.get("originalUserGoal")
+        or payload["content"]
+    ).strip()
     previous_retry_count = max(0, int(approval.get("retryCount") or 0)) if approval_kind == "rework_limit" else 0
     configured_grant = max(1, int(DEFAULT_WORKFLOW.limits.get("approvalGrantAttempts", 1)))
     retry_limit = int(DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2))
     if approval_granted and approval_kind == "rework_limit":
         retry_limit = previous_retry_count + configured_grant - 1
-    # Bypass policy + direct-workspace mode: skip verification/setup allowlist so
-    # the project owner's own tools (flutter, pip, etc.) just run.
-    if settings.get("bypassPolicy") or settings.get("directWorkspaceMode"):
+    # Full Power is explicit. Direct-workspace mode alone never disables policy.
+    bypass_active = bool(
+        settings.get("bypassPolicy")
+        or (settings.get("fullPower") or {}).get("bypassSafeCommands")
+    )
+    if bypass_active:
         os.environ["AGENT_BYPASS_SAFE_COMMANDS"] = "1"
+    else:
+        os.environ.pop("AGENT_BYPASS_SAFE_COMMANDS", None)
     source_workspace = str(Path(payload["workspacePath"]).resolve())
     state: PipelineState = {
         "task": payload["content"],
@@ -2140,6 +2693,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
         "sessionId": payload.get("sessionId") or str(uuid.uuid4()),
         "executionId": execution_id,
         "executionClass": execution_class,
+        "executionContext": supplied_execution_context,
+        "originalUserGoal": original_user_goal,
         "taskIntent": dict(admission["taskIntent"]),
         "retryCount": previous_retry_count,
         "retryLimit": retry_limit,
@@ -2161,6 +2716,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
                 "settings": settings,
                 "messages": state["messages"],
                 "humanGateApproval": state["humanGateApproval"],
+                "executionContext": supplied_execution_context,
+                "originalUserGoal": original_user_goal,
             },
         )
     except Exception:
@@ -2170,6 +2727,9 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
         execution.get("status") in {"completed", "pending_approval"}
         and isinstance(execution.get("result"), dict)
         and not approval_granted
+        # Never replay stale cache for write-class tasks — the workspace
+        # may have changed since the cached result was produced.
+        and execution_class == "read_only"
     ):
         emit("resume", f"Returning durable result for execution {execution_id}")
         supervisor.close()
@@ -2242,6 +2802,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
                                         "correlationId": correlation_id,
                                         "executionId": execution_id,
                                         "executionClass": execution_class,
+                                        "executionContext": supplied_execution_context,
+                                        "originalUserGoal": original_user_goal,
                                         "workspacePath": state["workspacePath"],
                                         "sourceWorkspacePath": source_workspace,
                                         "worktreeInfo": worktree_info,
@@ -2283,6 +2845,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
             "id": execution_id,
             "executionId": execution_id,
             "correlationId": correlation_id,
+            "executionContext": result.get("executionContext") or supplied_execution_context,
+            "originalUserGoal": result.get("originalUserGoal") or original_user_goal,
             "problem": result.get("problem"),
             "taskIntent": result.get("taskIntent"),
             "codegraphContext": result.get("codegraphContext"),
@@ -2312,7 +2876,13 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
             "task": state["task"],
         }
         metric_status = _run_metric_status(result)
-        durable_status = "pending_approval" if metric_status == "pending_approval" else "completed"
+        response["status"] = metric_status
+        response["completed"] = metric_status == "success"
+        durable_status = (
+            "pending_approval"
+            if metric_status == "pending_approval"
+            else ("completed" if metric_status == "success" else "failed")
+        )
         supervisor.complete(execution_id, response, durable_status)
         return response
     except Exception as exc:

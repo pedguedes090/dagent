@@ -253,6 +253,39 @@ def _build_anthropic_messages(
     return user_assistant, system_content
 
 
+_STREAM_EMIT: Callable[..., None] | None = None
+_STREAM_NODE: str = ""
+
+
+def set_stream_emit(emit: Callable[..., None] | None, node: str = "") -> None:
+    """Wire a global emit() so claude_adapter streams text_delta chunks into the UI."""
+    global _STREAM_EMIT, _STREAM_NODE
+    _STREAM_EMIT = emit
+    _STREAM_NODE = node or ""
+
+
+def _render_prompt(messages: list["ClaudeMessage"]) -> str:
+    """Flatten the message list into readable prompt text for the Inspector."""
+    parts: list[str] = []
+    for m in messages or []:
+        role = getattr(m, "role", "?")
+        content = getattr(m, "content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            chunks = []
+            for block in content:
+                if isinstance(block, dict):
+                    chunks.append(block.get("text") or block.get("content") or str(block))
+                else:
+                    chunks.append(str(block))
+            text = "\n".join(c for c in chunks if c)
+        else:
+            text = str(content)
+        parts.append(f"[{role}]\n{text}")
+    return "\n\n".join(parts)
+
+
 class ClaudeProvider:
     """Anthropic SDK implementation of ModelProvider."""
 
@@ -382,6 +415,39 @@ class ClaudeProvider:
                         "output_tokens": usage.output_tokens,
                     })
 
+                    # Forward token usage to telemetry so traced_node's
+                    # get_token_usage_delta() is non-empty on the real LLM path
+                    # (enables per-node token throughput). Best-effort.
+                    try:
+                        if hasattr(telemetry, "record_token_usage"):
+                            telemetry.record_token_usage(
+                                usage.input_tokens + usage.output_tokens, self.config.model
+                            )
+                    except Exception:
+                        pass
+
+                    # Emit an llm_call event carrying the actual prompt + response
+                    # so the Inspector Messages subtab can show real text, not
+                    # just model/token counts.
+                    if _STREAM_EMIT is not None:
+                        try:
+                            prompt_text = _render_prompt(messages)
+                            _STREAM_EMIT(
+                                _STREAM_NODE or "llm",
+                                f"LLM call · {self.config.model}",
+                                node=_STREAM_NODE or None,
+                                event_type="llm_call",
+                                model=self.config.model,
+                                input=prompt_text[:48000],
+                                output=("".join(text_parts))[:48000],
+                                token_usage={
+                                    "input": usage.input_tokens,
+                                    "output": usage.output_tokens,
+                                },
+                            )
+                        except Exception:
+                            pass
+
                     return ClaudeResponse(
                         id=response.id or str(uuid.uuid4()),
                         model=response.model,
@@ -490,6 +556,19 @@ class ClaudeProvider:
                         text_blocks.setdefault(event.index, "")
                         text_blocks[event.index] += delta.text
                         events.append(ClaudeStreamEvent(type="text_delta", text=delta.text))
+                        if _STREAM_EMIT is not None:
+                            try:
+                                _STREAM_EMIT(
+                                    _STREAM_NODE or "llm",
+                                    delta.text[:200],
+                                    node=_STREAM_NODE or None,
+                                    event_type="llm_chunk",
+                                    tool="llm",
+                                    status="running",
+                                    chunk_text=delta.text,
+                                )
+                            except Exception:
+                                pass
                     elif hasattr(delta, "type") and delta.type == "input_json_delta":
                         blob = tool_use_blocks.setdefault(event.index, {"id": "", "name": "", "input_json": ""})
                         blob["input_json"] += getattr(delta, "partial_json", "")
@@ -541,6 +620,14 @@ class ClaudeProvider:
             output_tokens=self._total_usage.output_tokens + final_usage.output_tokens,
             model=self.config.model,
         )
+        # Forward streamed token usage to telemetry (per-node throughput).
+        try:
+            if hasattr(telemetry, "record_token_usage"):
+                telemetry.record_token_usage(
+                    final_usage.input_tokens + final_usage.output_tokens, self.config.model
+                )
+        except Exception:
+            pass
 
         response = ClaudeResponse(
             id=message_id or str(uuid.uuid4()),

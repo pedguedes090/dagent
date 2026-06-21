@@ -1,16 +1,18 @@
 """Contract tests for the autonomous next-task selector.
 
-These cover the priority ordering the Auto Loop UI relies on:
-  security > test_coverage > maintainability > technical_debt > enhancement_idea
-and guarantee the rotating-idea pool never starves (i.e. when findings are
-exhausted or all completed, an idea is always returned until the pool is
-fully drained too).
+After the council refactor, select_next_task has two lanes:
+  - PRODUCT lane (whenever product_goal is set):
+    iteration 0 returns the literal user goal; iteration >= 1 delegates to the
+    council. NO hard-coded enhancement pool exists.
+  - PLATFORM_MAINTENANCE lane (only when no product goal is set):
+    findings ranked by category (security > test_coverage > maintainability >
+    technical_debt). Returns None when findings are exhausted — no pool fallback.
 """
 from __future__ import annotations
 
 import unittest
 
-from agent_engine.autonomy import select_next_task, _ENHANCEMENT_IDEAS
+from agent_engine.autonomy import build_autonomous_bootstrap, select_next_task
 
 
 def _f(fid: str, category: str, priority: float, *, title: str = "t") -> dict:
@@ -29,7 +31,9 @@ def _f(fid: str, category: str, priority: float, *, title: str = "t") -> dict:
     }
 
 
-class SelectNextTaskTests(unittest.TestCase):
+class PlatformMaintenanceLaneTests(unittest.TestCase):
+    """No product_goal → findings-only platform maintenance ordering."""
+
     def test_security_beats_test_coverage_beats_maintainability(self) -> None:
         report = {
             "findings": [
@@ -59,22 +63,12 @@ class SelectNextTaskTests(unittest.TestCase):
         task = select_next_task(report, completed_ids={"a"})
         self.assertEqual(task["id"], "b")
 
-    def test_falls_back_to_enhancement_pool_when_findings_empty(self) -> None:
-        task = select_next_task({"findings": []}, completed_ids=set())
-        self.assertIsNotNone(task)
-        self.assertEqual(task["kind"], "enhancement_idea")
-        # Default cursor=0 picks the first idea.
-        self.assertEqual(task["id"], _ENHANCEMENT_IDEAS[0]["id"])
+    def test_returns_none_when_no_goal_and_no_findings(self) -> None:
+        self.assertIsNone(select_next_task({"findings": []}, completed_ids=set()))
 
-    def test_idea_cursor_rotates_through_pool(self) -> None:
-        task1 = select_next_task({}, completed_ids=set(), idea_cursor=0)
-        task2 = select_next_task({}, completed_ids=set(), idea_cursor=1)
-        self.assertNotEqual(task1["id"], task2["id"])
-
-    def test_returns_none_when_findings_and_ideas_exhausted(self) -> None:
-        completed = {idea["id"] for idea in _ENHANCEMENT_IDEAS}
-        task = select_next_task({"findings": []}, completed_ids=completed)
-        self.assertIsNone(task)
+    def test_returns_none_when_all_findings_completed(self) -> None:
+        report = {"findings": [_f("a", "security", 5.0)]}
+        self.assertIsNone(select_next_task(report, completed_ids={"a"}))
 
     def test_finding_task_body_includes_recommendation(self) -> None:
         report = {"findings": [_f("x", "security", 5.0, title="risky pattern")]}
@@ -82,6 +76,58 @@ class SelectNextTaskTests(unittest.TestCase):
         self.assertIn("risky pattern", task["task"])
         self.assertIn("rec", task["task"])
         self.assertIn("src/x.py:1", task["task"])
+
+
+class ProductLaneTests(unittest.TestCase):
+    """product_goal set + workspace is a user product → council path; iter 0
+    returns the user prompt verbatim; if no council winner, returns None — no
+    hard-coded fallback."""
+
+    def test_iteration_zero_returns_user_goal_verbatim(self) -> None:
+        task = select_next_task(
+            {"workspacePath": "/tmp/music-app", "findings": []},
+            completed_ids=set(),
+            product_goal="code web nghe nhạc",
+            iteration=0,
+            council_round=lambda **_: None,
+            session_id="s",
+            workspace_path="/tmp/music-app",
+        )
+        self.assertEqual(task["kind"], "user_goal")
+        self.assertEqual(task["task"], "code web nghe nhạc")
+        self.assertTrue(task["executionContext"]["requiresMutation"])
+
+    def test_product_goal_wins_even_when_workspace_is_agent_platform(self) -> None:
+        task = select_next_task(
+            {"workspacePath": "C:/fractal-agent-system", "findings": [_f("platform", "security", 9.0)]},
+            completed_ids=set(),
+            product_goal="code web nghe nhạc",
+            iteration=0,
+            workspace_path="C:/fractal-agent-system",
+        )
+
+        self.assertEqual(task["kind"], "user_goal")
+        self.assertEqual(task["originalUserGoal"], "code web nghe nhạc")
+        self.assertNotEqual(task["id"], "platform")
+
+    def test_bootstrap_uses_goal_specific_product_root_and_write_contract(self) -> None:
+        task = build_autonomous_bootstrap("tạo web xem phim", "C:/workspace")
+
+        self.assertTrue(task["productRoot"].replace("\\", "/").endswith("/movie-app"))
+        self.assertEqual(task["executionContext"]["executionClass"], "write")
+        self.assertFalse(task["executionContext"]["reportOnly"])
+
+    def test_no_council_winner_returns_none(self) -> None:
+        task = select_next_task(
+            {"workspacePath": "/tmp/music-app", "findings": []},
+            completed_ids={"user-goal-iter0"},
+            product_goal="code web nghe nhạc",
+            iteration=2,
+            council_round=lambda **_: {"winner": None, "proposals": []},
+            session_id="s",
+            workspace_path="/tmp/music-app",
+        )
+        self.assertIsNone(task)
 
 
 if __name__ == "__main__":

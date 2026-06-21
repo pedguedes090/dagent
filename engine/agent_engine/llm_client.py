@@ -241,7 +241,7 @@ class ChatClient:
                     {
                         "role": "system",
                         "content": (
-                            "You are a read-only planning/review agent inside a LangGraph coding pipeline. "
+                            "You are an autonomous planning/review agent inside a LangGraph coding pipeline. "
                             "Return valid JSON only. The user prefers Vietnamese final summaries."
                         ),
                     },

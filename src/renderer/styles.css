@@ -35,7 +35,47 @@
   --shadow-md: 0 4px 12px rgba(0,0,0,0.06);
   --shadow-drawer: -4px 0 24px rgba(0,0,0,0.10);
 
+  /* Animation tokens */
+  --anim-fast: 0.12s;
+  --anim-normal: 0.20s;
+  --anim-slow: 0.65s;
+
   color-scheme: light;
+}
+
+/* ── Dark mode tokens ──────────────────────────────────────────────────── */
+[data-theme="dark"] {
+  --bg: #0F1117;
+  --surface: #1A1D23;
+  --surface-subtle: #14171F;
+  --text: #E2E8F0;
+  --text-muted: #8896A5;
+  --border: #2D313A;
+  --accent: #2FBCA3;
+  --accent-soft: #162C2B;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.20);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.30);
+  --shadow-drawer: -4px 0 24px rgba(0,0,0,0.40);
+  color-scheme: dark;
+}
+
+/* ── Accessibility: focus-visible ─────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ── Reduced motion ───────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .flow-canvas::after { display: none; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -478,6 +518,12 @@ label span { color: var(--text-muted); font-size: 11px; font-weight: 600; text-t
 }
 .flow-svg { display: block; width: 100%; height: 100%; user-select: none; }
 
+/* Per-node speed / load chip (fast/slow band) */
+text.flow-node-speed { fill: #64748B; pointer-events: none; }
+text.flow-node-speed.speed-fast { fill: #34D399; }
+text.flow-node-speed.speed-warn { fill: #FBBF24; }
+text.flow-node-speed.speed-slow { fill: #F87171; }
+
 .flow-toolbar {
   position: absolute; top: 10px; right: 10px; z-index: 5;
   display: flex; align-items: center; gap: 6px;
@@ -590,6 +636,17 @@ label span { color: var(--text-muted); font-size: 11px; font-weight: 600; text-t
   background: var(--surface-subtle); border: 1px solid var(--border);
   border-radius: var(--radius-sm); padding: 8px; font-size: 11px;
   max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+.flow-subbody pre.event-json.io-scroll { max-height: 360px; }
+.io-block { margin-bottom: 10px; }
+.io-meta { font-size: 10px; margin-bottom: 3px; }
+/* Expandable prompt/response cells in the Messages subtab */
+.msg-io { margin: 2px 0; }
+.msg-io > summary { cursor: pointer; color: var(--accent); font-size: 11px; }
+.msg-io > pre {
+  background: var(--surface-subtle); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px; font-size: 11px; margin-top: 4px;
+  max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word;
 }
 
 /* Handoff chips */

@@ -89,7 +89,7 @@ class Phase2ApprovalFlowTests(unittest.TestCase):
         self.assertEqual(review["blockers"], [])
         self.assertEqual(len(review["warnings"]), 2)
 
-    def test_rework_approval_reuses_execution_id(self) -> None:
+    def test_execution_identity_survives_legacy_approval_and_rework_is_autonomous(self) -> None:
         root = Path(__file__).resolve().parents[1]
         backend = (root / "src" / "main" / "backendService.js").read_text(encoding="utf-8")
         main = (root / "src" / "main" / "main.js").read_text(encoding="utf-8")
@@ -98,9 +98,23 @@ class Phase2ApprovalFlowTests(unittest.TestCase):
         self.assertIn("humanGateApproval?.executionId || crypto.randomUUID()", backend)
         self.assertIn("executionId: pendingHumanGate.executionId || null", main)
         self.assertIn("(item.executionId || item.id) !== runIdentity", main)
-        self.assertIn('"kind": "rework_limit"', graph)
-        self.assertIn('"grantAdditionalAttempts": grant', graph)
+        self.assertNotIn('"kind": "rework_limit"', graph)
+        self.assertIn('"autoReworkGranted": True', graph)
+        self.assertIn("Retry limit exhausted", graph)
         self.assertIn('f"{execution_id}:approval:"', graph)
+
+    def test_autonomous_execution_contract_crosses_renderer_main_and_backend(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        renderer = (root / "src" / "renderer" / "app.js").read_text(encoding="utf-8")
+        main = (root / "src" / "main" / "main.js").read_text(encoding="utf-8")
+        backend = (root / "src" / "main" / "backendService.js").read_text(encoding="utf-8")
+        server = (root / "engine" / "agent_engine" / "server.py").read_text(encoding="utf-8")
+
+        self.assertIn("executionContext: opts.executionContext || null", renderer)
+        self.assertIn("requestedExecutionContext", main)
+        self.assertIn("executionContext,", backend)
+        self.assertIn('dict(payload.get("executionContext") or {})', server)
+        self.assertIn('permissionProfile: "workspace-write"', renderer)
 
     @pytest.mark.slow
     def test_write_task_continues_without_container_using_policy_limited_host_fallback(self) -> None:

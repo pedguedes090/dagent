@@ -274,12 +274,25 @@ function registerIpc() {
     };
   });
 
+  ipcMain.handle("agent:memory-record", async (_event, payload) => {
+    return backendService.recordMemory(payload || {});
+  });
+
+  ipcMain.handle("agent:memory-critique", async (_event, payload) => {
+    return backendService.critiqueMemory(payload || {});
+  });
+
   ipcMain.handle("agent:autonomy-next-task", async (_event, payload) => {
     return backendService.requestAutonomyNextTask({
       workspacePath: payload?.workspacePath || "",
       completedIds: payload?.completedIds || [],
       ideaCursor: payload?.ideaCursor || 0,
       rescanIfStale: !!payload?.rescanIfStale,
+      productGoal: payload?.productGoal || "",
+      sessionId: payload?.sessionId || "",
+      iteration: Number(payload?.iteration || 0),
+      iterationHistory: Array.isArray(payload?.iterationHistory) ? payload.iterationHistory : [],
+      settings: payload?.settings || {},
     });
   });
 
@@ -340,6 +353,9 @@ function registerIpc() {
     }
 
     const originalContent = String(payload?.content || "").trim();
+    const requestedExecutionContext = payload?.executionContext && typeof payload.executionContext === "object"
+      ? { ...payload.executionContext }
+      : {};
     const pendingHumanGate = isConfirmationText(originalContent)
       ? sessionStore.getPendingApproval(session.id) || findPendingHumanGateTask(session)
       : null;
@@ -375,6 +391,15 @@ function registerIpc() {
           : run
       );
     }
+    if (!pendingHumanGate && !String(session.productGoal || "").trim()) {
+      session.productGoal = String(requestedExecutionContext.originalUserGoal || originalContent).trim();
+    }
+    const executionContext = {
+      ...requestedExecutionContext,
+      originalUserGoal: String(
+        requestedExecutionContext.originalUserGoal || session.productGoal || originalContent
+      ).trim()
+    };
     session.messages = [...(session.messages || []), userMessage];
     session = sessionStore.save(session);
 
@@ -422,6 +447,7 @@ function registerIpc() {
               grantAdditionalAttempts: Number(pendingHumanGate.grantAdditionalAttempts || 0)
             }
           : null,
+        executionContext,
         emitProgress,
         signal: controller.signal
       });
@@ -436,9 +462,12 @@ function registerIpc() {
 
       session.messages = [...session.messages, assistantMessage];
       const runIdentity = run.executionId || run.id;
+      const runFailed = run?.completed === false
+        || ["failed", "error", "blocked", "incomplete"].includes(String(run?.status || "").toLowerCase())
+        || run?.review?.passed === false;
       const completionProgress = {
-        stage: "done",
-        detail: "Hoàn tất",
+        stage: runFailed ? "error" : "done",
+        detail: runFailed ? "Chưa hoàn tất — cần tiếp tục sửa" : "Hoàn tất",
         at: new Date().toISOString()
       };
       const observedRun = {

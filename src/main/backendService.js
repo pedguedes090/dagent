@@ -95,7 +95,7 @@ class AgentBackendService {
     return this.readyPromise;
   }
 
-  async runPipeline({ settings, workspacePath, messages, userText, sessionId, humanGateApproval, emitProgress }) {
+  async runPipeline({ settings, workspacePath, messages, userText, sessionId, humanGateApproval, executionContext, emitProgress }) {
     const correlationId = humanGateApproval?.correlationId || crypto.randomUUID();
     const executionId = humanGateApproval?.executionId || crypto.randomUUID();
     const maxTransportRetries = 1;
@@ -110,6 +110,7 @@ class AgentBackendService {
           userText,
           sessionId,
           humanGateApproval,
+          executionContext,
           emitProgress,
           correlationId,
           executionId
@@ -142,6 +143,7 @@ class AgentBackendService {
     emitProgress,
     correlationId,
     executionId,
+    executionContext,
     signal
   }) {
     const endpoint = await this.start();
@@ -159,7 +161,9 @@ class AgentBackendService {
         workspacePath,
         settings,
         messages,
-        humanGateApproval
+        humanGateApproval,
+        executionContext: executionContext || null,
+        originalUserGoal: executionContext?.originalUserGoal || userText
       }),
       signal
     });
@@ -177,11 +181,46 @@ class AgentBackendService {
     let result = null;
     let engineError = null;
 
+    // Wall-clock safety net: a hung backend (e.g. a stuck openhands_worker
+    // conversation.run()) must never freeze the UI forever. We bound BOTH the
+    // gap between NDJSON lines (idle timeout) and the total run duration (hard
+    // cap). On either deadline we cancel the stream, ask the backend to cancel
+    // its run, and reject so state.running is cleared and agent:run-finished
+    // fires. Defaults are generous; override via env for long jobs.
+    const IDLE_TIMEOUT_MS = Number(process.env.AGENT_RUN_IDLE_TIMEOUT_MS) || 600000; // 10 min between chunks
+    const HARD_TIMEOUT_MS = Number(process.env.AGENT_RUN_HARD_TIMEOUT_MS) || 3600000; // 1 h total
+    const runStartedAt = Date.now();
+    let lastChunkAt = Date.now();
+
+    const cancelBackendRun = () => {
+      // Best-effort: tell the Python server to abort its run for this id so the
+      // _WRITE_LOCK is released and queued runs can proceed.
+      fetch(`${endpoint}/v1/runs/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ executionId, correlationId })
+      }).catch(() => {});
+    };
+
+    // reader.read() can block indefinitely; race it against a deadline timer so
+    // a silent backend cannot wedge the loop.
+    const readWithDeadline = () => {
+      const remainingIdle = IDLE_TIMEOUT_MS - (Date.now() - lastChunkAt);
+      const remainingHard = HARD_TIMEOUT_MS - (Date.now() - runStartedAt);
+      const budget = Math.max(0, Math.min(remainingIdle, remainingHard));
+      let timer = null;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ __timedOut: true }), budget);
+      });
+      return Promise.race([reader.read(), timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    };
+
     while (true) {
+      let chunk;
       try {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        chunk = await readWithDeadline();
       } catch (e) {
         if (signal?.aborted) {
           reader.cancel("cancelled");
@@ -189,6 +228,19 @@ class AgentBackendService {
         }
         throw e;
       }
+      if (chunk.__timedOut) {
+        reader.cancel("timeout").catch(() => {});
+        cancelBackendRun();
+        const idleFor = Math.round((Date.now() - lastChunkAt) / 1000);
+        const ranFor = Math.round((Date.now() - runStartedAt) / 1000);
+        throw new Error(
+          `Agent backend bi treo — khong co phan hoi (idle ${idleFor}s, tong ${ranFor}s). Da huy run.`
+        );
+      }
+      const { done, value } = chunk;
+      if (done) break;
+      lastChunkAt = Date.now();
+      buffer += decoder.decode(value, { stream: true });
       if (signal?.aborted) {
         reader.cancel("cancelled");
         return { id: executionId, executionId, cancelled: true };
@@ -223,7 +275,8 @@ class AgentBackendService {
             "promptTemplate", "input", "output", "outputDelta",
             "toolInput", "toolResult", "changedFiles",
             "evidence", "blockers", "confidence",
-            "sequence", "issueCount", "passed"
+            "sequence", "issueCount", "passed",
+            "chunkText"
           ];
           for (const key of ENRICHED) {
             if (message[key] !== undefined && message[key] !== null) {
@@ -376,7 +429,7 @@ class AgentBackendService {
     return payload;
   }
 
-  async requestAutonomyNextTask({ workspacePath, completedIds, ideaCursor, rescanIfStale }) {
+  async requestAutonomyNextTask({ workspacePath, completedIds, ideaCursor, rescanIfStale, productGoal, sessionId, iteration, iterationHistory, settings }) {
     const endpoint = await this.start();
     const response = await fetch(`${endpoint}/v1/autonomy/next-task`, {
       method: "POST",
@@ -386,6 +439,11 @@ class AgentBackendService {
         completedIds: completedIds || [],
         ideaCursor: ideaCursor || 0,
         rescanIfStale: !!rescanIfStale,
+        productGoal: productGoal || "",
+        sessionId: sessionId || "",
+        iteration: Number(iteration || 0),
+        iterationHistory: Array.isArray(iterationHistory) ? iterationHistory : [],
+        settings: settings || {},
       }),
     });
     const body = await response.text().catch(() => "");
@@ -396,6 +454,28 @@ class AgentBackendService {
       throw new Error(`Autonomy next-task loi ${response.status}: ${message}`);
     }
     return payload;
+  }
+
+  async recordMemory(payload) {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/memory/record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    const body = await response.text().catch(() => "");
+    try { return body ? JSON.parse(body) : null; } catch { return null; }
+  }
+
+  async critiqueMemory(payload) {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/memory/critique`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    const body = await response.text().catch(() => "");
+    try { return body ? JSON.parse(body) : null; } catch { return null; }
   }
 
   stop() {

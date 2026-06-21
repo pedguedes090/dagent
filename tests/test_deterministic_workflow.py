@@ -36,6 +36,19 @@ class DeterministicWorkflowTests(unittest.TestCase):
             ),
             "execution_gate",
         )
+        self.assertEqual(
+            workflow.route(
+                "reviewer_decision",
+                {
+                    "has_result": False,
+                    "worker_error_can_rework": False,
+                    "blocked": False,
+                    "can_rework": False,
+                    "review_passed": False,
+                },
+            ),
+            "execution_gate",
+        )
         self.assertEqual(workflow.route("execution_gate", {"auto_rework_granted": True}), "openhands_worker")
         # When auto-rework is exhausted, route MUST land on the reporter so
         # assistantText is assembled and finalize_workspace runs — routing
