@@ -366,6 +366,7 @@ def run_claude_code_worker(
         "sandboxDiff": [],
         "policyViolations": [],
         "appliedChanges": changed,
+        "changedFiles": changed,  # consumer contract (graph reads this key)
         "scaffoldFallback": None,
         "sandboxed": False,
         "events": events,
