@@ -2417,8 +2417,24 @@ function _doctorBindIpc() {
 let _swarm3d = null;
 
 function _swarmInit() {
+  if (!window.THREE) { console.warn("Three.js not loaded — 3D map unavailable"); return; }
+  // Lazy-init 3D map when swarm tab is first opened.
   const container = document.getElementById("swarm3dContainer");
   if (!container || !window.Swarm3DMap) return;
+  let _swarmReady = false;
+  function _ensureSwarm() {
+    if (!_swarmReady) {
+      const tab = document.getElementById("tab-swarm");
+      if (!tab || !tab.classList.contains("active")) return;
+      _swarm3d = new Swarm3DMap(container);
+      window._swarm3d = _swarm3d;
+      _swarmReady = true;
+    }
+  }
+  // Watch tab switches (lazy init).
+  document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+    if (t.dataset.tab === "swarm") setTimeout(_ensureSwarm, 100);
+  }));
   // Listen for swarm tree data from progress events.
   window.addEventListener("agent:progress", (ev) => {
     const p = ev.detail || ev;
